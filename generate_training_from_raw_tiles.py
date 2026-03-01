@@ -165,8 +165,16 @@ def clean_sample(patch):
     if skimage.measure.shannon_entropy(patch) < MIN_ENTROPY:
         return None
 
-    # [0, 1] に正規化（パッチ内相対値）
-    return (patch - patch.min()) / elev_range
+    # 絶対標高スケール [0, 1600m] で正規化
+    MAX_ELEV = 1600.0
+    p_max = float(patch.max())
+    if p_max > MAX_ELEV:
+        patch = patch - (p_max - MAX_ELEV)   # max が 1600m になるようシフト
+        p_min = float(patch.min())
+        if p_min < 0.0:
+            # シフト後に 0m 未満が生じる場合 → [0, 1600] に収まるようスケーリング
+            patch = (patch - p_min) / (MAX_ELEV - p_min) * MAX_ELEV
+    return patch / MAX_ELEV
 
 
 def get_variants(a):
