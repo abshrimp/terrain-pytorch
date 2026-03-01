@@ -13,7 +13,6 @@ training_images/
 # Generated terrain files.
 ml_outputs/
 sim_snaps/
-*.np[yz]
 
 # Misc files.
 .DS_Store
