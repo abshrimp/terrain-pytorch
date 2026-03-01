@@ -90,6 +90,10 @@ class Dataset(torch.utils.data.Dataset):
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
+        # PyTorch does not support uint16. Promote to int32 which preserves
+        # all values in [0, 65535] and is supported by torch.as_tensor().
+        if image.dtype == np.uint16:
+            image = image.astype(np.int32)
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
