@@ -210,10 +210,13 @@ class ImageFolderDataset(Dataset):
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
         with self._open_file(fname) as f:
-            if pyspng is not None and self._file_ext(fname) == '.png':
-                image = pyspng.load(f.read())
-            else:
-                image = np.array(PIL.Image.open(f))
+            # pyspng splits 16-bit grayscale into (H,W,2) uint8, causing C=2.
+            # Always use PIL for correct 16-bit support.
+            image = np.array(PIL.Image.open(f))
+        # PIL loads 16-bit PNG as int32 (mode 'I') on some systems.
+        # Cast to uint16 to normalise; values are always in [0, 65535].
+        if image.dtype == np.int32:
+            image = image.astype(np.uint16)
         if image.ndim == 2:
             image = image[:, :, np.newaxis] # HW => HWC
         image = image.transpose(2, 0, 1) # HWC => CHW

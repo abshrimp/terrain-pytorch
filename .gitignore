@@ -21,3 +21,5 @@ sim_snaps/
 training_samples/
 .claude/
 .venv/
+
+memo.bash
