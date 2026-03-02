@@ -2,16 +2,26 @@
 """
 generate_island.py
 
-StyleGAN2-ADA で学習した地形モデルから複数タイルを生成・縫い合わせて、
-約 6000 km² の島 heightmap を作成する。
+根本的アプローチ: 手続き的基盤 + AI テクスチャ
 
-タイル 1 枚 = 20km × 20km (512×512px)
-デフォルト 5×5 グリッド = 100km × 100km に円形マスクで島を切り出す。
+【問題】
+  AI タイルを縫い合わせるアプローチの限界:
+    - 各タイルが独立に生成されるため大規模構造(山脈・谷)がタイルごとに無関係
+    - シームブレンドを工夫してもタイル境界で地形の「意味」が断絶する
+
+【解決策: 役割分担】
+  ① 大規模構造 → FFT フラクタルノイズ (全島で空間的一貫性を保証)
+  ② 局所テクスチャ → AI タイルの高周波成分 (Hanning 窓 + 半ストライド重畳)
+  ③ ① + ② を合成 → 島マスクを適用
+
+  AI タイルは「貼り合わせる構造素材」ではなく「繰り返し適用できるテクスチャ」として使う。
+  Hanning 窓により各テクスチャタイルのエッジが自然にゼロになるため、
+  シームレスに重ね合わせることができる。
 
 使い方:
     python generate_island.py --network snapshots/network-snapshot-000400.pkl
-    python generate_island.py --network ... --seed-start 100 --colorize
-    python generate_island.py --network ... --no-generate --colorize  # タイル再利用
+    python generate_island.py --network ... --base-seed 7 --mask-seed 3 --colorize
+    python generate_island.py --no-generate --base-seed 7 --colorize  # タイル再利用
 """
 
 import argparse
@@ -21,121 +31,168 @@ import subprocess
 import cv2
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter
 
 # ── 定数 ────────────────────────────────────────────────────────────────────
-TILE_KM = 20        # タイル 1 辺の実距離 (km)
-TILE_PX = 512       # タイル 1 辺のピクセル数
-KM_PER_PX = TILE_KM / TILE_PX   # ≈ 0.039 km/px ≈ 39 m/px
+TILE_KM   = 20
+TILE_PX   = 512
+ISLAND_KM = 100                         # 島を包む正方形 (km)
+KM_PER_PX = TILE_KM / TILE_PX          # ≈ 0.039 km/px ≈ 39 m/px
+MAP_PX    = int(ISLAND_KM / KM_PER_PX) # = 2560 px
 
 
-# ── タイル生成 ───────────────────────────────────────────────────────────────
-def generate_tiles(network: str, seed_start: int, n_tiles: int,
+# ── AI タイル ────────────────────────────────────────────────────────────────
+def generate_tiles(network: str, seed_start: int, n: int,
                    trunc: float, outdir: str) -> None:
-    """StyleGAN2-ADA で n_tiles 枚の地形タイルを生成する。"""
-    seeds = ",".join(str(seed_start + i) for i in range(n_tiles))
+    seeds = ",".join(str(seed_start + i) for i in range(n))
     cmd = [
         "python", "stylegan2-ada-pytorch/generate.py",
-        f"--outdir={outdir}",
-        f"--trunc={trunc}",
-        f"--seeds={seeds}",
-        f"--network={network}",
+        f"--outdir={outdir}", f"--trunc={trunc}",
+        f"--seeds={seeds}", f"--network={network}",
     ]
-    print("タイル生成:", " ".join(cmd))
+    print("AI タイル生成:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
 
 def load_tile(path: str) -> np.ndarray:
-    """PNG タイルを float32 [0, 1] の 512×512 配列として読み込む。"""
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     if img is None:
-        raise FileNotFoundError(f"タイルが読み込めません: {path}")
+        raise FileNotFoundError(f"読み込み失敗: {path}")
     if len(img.shape) == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    if img.dtype == np.uint16:
-        return img.astype(np.float32) / 65535.0
-    return img.astype(np.float32) / 255.0
+    scale = 65535.0 if img.dtype == np.uint16 else 255.0
+    return img.astype(np.float32) / scale
 
 
-def load_all_tiles(outdir: str, seed_start: int, n_tiles: int) -> list:
-    tiles = []
-    for i in range(n_tiles):
-        seed = seed_start + i
-        path = os.path.join(outdir, f"seed{seed:04d}.png")
-        tiles.append(load_tile(path))
-        print(f"  読み込み: seed{seed:04d}.png", end="\r")
-    print()
-    return tiles
-
-
-# ── タイル縫い合わせ ─────────────────────────────────────────────────────────
-def stitch_tiles(tiles: list, grid_w: int, grid_h: int,
-                 blend_width: int = 64) -> np.ndarray:
+# ── ① 手続き的基盤地形 (FFT フラクタルノイズ) ───────────────────────────────
+def fractal_terrain(h: int, w: int, seed: int = 0, beta: float = 2.2) -> np.ndarray:
     """
-    タイルを grid_w × grid_h に縫い合わせる。
+    ガウス乱数場をフーリエ域でスペクトル成形して地形的なフラクタルを生成する。
 
-    1. 隣接タイルの境界で平均標高を合わせるオフセット補正
-       (水平方向 → 垂直方向の順に適用)
-    2. シーム幅 blend_width px の Gaussian ブレンドで不連続を滑らか化
+    パワースペクトル ∝ k^(-beta):
+      beta = 2.0  → 茶色雑音（やや滑らか）
+      beta = 2.2  → 地形らしいスペクトル（デフォルト）
+      beta = 2.5  → 急峻な地形
+
+    全解像度で一度に生成するため、タイル結合の問題が根本的に存在しない。
     """
-    adjusted = [t.copy() for t in tiles]
+    rng = np.random.default_rng(seed)
+    F = rng.standard_normal((h, w)) + 1j * rng.standard_normal((h, w))
 
-    # 水平方向オフセット補正（左 → 右）
-    for row in range(grid_h):
-        for col in range(1, grid_w):
-            L = adjusted[row * grid_w + col - 1]
-            R = adjusted[row * grid_w + col]
-            diff = float(L[:, -16:].mean() - R[:, :16].mean())
-            adjusted[row * grid_w + col] = np.clip(R + diff, 0.0, 1.0)
+    fy = np.fft.fftfreq(h)[:, None]
+    fx = np.fft.fftfreq(w)[None, :]
+    freq = np.sqrt(fy ** 2 + fx ** 2)
+    freq[0, 0] = 1.0            # DC 特異点を回避
+    power = freq ** (-beta / 2.0)
+    power[0, 0] = 0.0           # DC 成分 = 0（オフセットなし）
 
-    # 垂直方向オフセット補正（上 → 下）
-    for col in range(grid_w):
-        for row in range(1, grid_h):
-            T = adjusted[(row - 1) * grid_w + col]
-            B = adjusted[row * grid_w + col]
-            diff = float(T[-16:, :].mean() - B[:16, :].mean())
-            adjusted[row * grid_w + col] = np.clip(B + diff, 0.0, 1.0)
+    field = np.real(np.fft.ifft2(F * power)).astype(np.float32)
+    lo, hi = field.min(), field.max()
+    return (field - lo) / (hi - lo + 1e-8)
 
-    # キャンバスに配置
-    out_h = grid_h * TILE_PX
-    out_w = grid_w * TILE_PX
-    canvas = np.zeros((out_h, out_w), dtype=np.float32)
-    for row in range(grid_h):
-        for col in range(grid_w):
-            idx = row * grid_w + col
-            r0, c0 = row * TILE_PX, col * TILE_PX
-            canvas[r0:r0 + TILE_PX, c0:c0 + TILE_PX] = adjusted[idx]
 
-    # シーム部分の Gaussian ブレンド
-    half = blend_width // 2
-    sigma = half / 3.0
+def shape_island_base(raw: np.ndarray, seed: int = 0) -> np.ndarray:
+    """
+    フラクタルノイズを島らしい地形に成形する。
 
-    # 垂直シーム (x = col * TILE_PX) → 水平方向にブレンド
-    for col in range(1, grid_w):
-        c = col * TILE_PX
-        c0, c1 = max(0, c - half), min(out_w, c + half)
-        canvas[:, c0:c1] = gaussian_filter1d(canvas[:, c0:c1],
-                                             sigma=sigma, axis=1)
+    成形内容:
+      - 中央高・海岸低のラジアルプロファイルをブレンド（島の標高分布）
+      - リッジノイズで平坦部を尾根状に変換
+      - 累乗で山の尖りを強調
+    """
+    h, w = raw.shape
+    cy, cx = h / 2.0, w / 2.0
 
-    # 水平シーム (y = row * TILE_PX) → 垂直方向にブレンド
-    for row in range(1, grid_h):
-        r = row * TILE_PX
-        r0, r1 = max(0, r - half), min(out_h, r + half)
-        canvas[r0:r1, :] = gaussian_filter1d(canvas[r0:r1, :],
-                                             sigma=sigma, axis=0)
+    # 中央 = 1.0、端 = 0.0 の放射状プロファイル
+    yy, xx = np.mgrid[0:h, 0:w]
+    dist = np.clip(
+        np.sqrt(((yy - cy) / cy) ** 2 + ((xx - cx) / cx) ** 2), 0.0, 1.0
+    )
+    profile = (1.0 - dist) ** 1.5   # 中央が高く、海岸付近はなだらか
 
-    return np.clip(canvas, 0.0, 1.0)
+    # リッジノイズ: 滑らかな丘 → 尖った尾根に変換
+    ridge = 1.0 - np.abs(2.0 * raw - 1.0)
+
+    # ブレンド比率: フラクタル 45%、島プロファイル 40%、リッジ 15%
+    terrain = raw * 0.45 + profile * 0.40 + ridge * 0.15
+
+    # 累乗で高地をより尖らせ、低地をより低く
+    terrain = np.power(np.clip(terrain, 0.0, 1.0), 1.4)
+
+    lo, hi = terrain.min(), terrain.max()
+    return ((terrain - lo) / (hi - lo + 1e-8)).astype(np.float32)
+
+
+# ── ② AI テクスチャ詳細 ──────────────────────────────────────────────────────
+def extract_windowed_detail(tile: np.ndarray, sigma: float = 48.0) -> np.ndarray:
+    """
+    AI タイルから高周波詳細を抽出する。
+
+    処理:
+      1. ガウシアン高域通過フィルタで大域トレンドを除去
+         → ゼロ平均のローカルテクスチャのみ残る
+      2. Hanning 窓でエッジをゼロに揃える
+         → 重ね合わせ時にシームが自然に消える
+    """
+    # 高域通過: タイル - ガウシアン平滑化
+    detail = tile - gaussian_filter(tile, sigma=sigma)
+
+    # Hanning 窓（エッジ = 0、中央 = 1）
+    h, w = detail.shape
+    window = (
+        np.hanning(h).astype(np.float32)[:, None]
+        * np.hanning(w).astype(np.float32)[None, :]
+    )
+    return (detail * window).astype(np.float32)
+
+
+def create_texture_map(details: list, H: int, W: int, seed: int = 0,
+                       stride_frac: float = 0.5) -> np.ndarray:
+    """
+    Hanning 窓付き詳細タイルを半ストライドで重ね合わせてテクスチャマップを生成する。
+
+    Hanning 窓の重ね合わせ正規化により:
+      - 各位置で weight_sum ≈ 一定になる
+      - 隣接タイル間でシームレスに混合される
+      - AI タイルをランダムに選択することで繰り返しパターンを回避
+    """
+    rng    = np.random.default_rng(seed)
+    stride = max(1, int(TILE_PX * stride_frac))
+
+    canvas = np.zeros((H, W), dtype=np.float32)
+    wsum   = np.zeros((H, W), dtype=np.float32)
+
+    # Hanning 窓の 2 乗（正規化係数として使用）
+    win_sq = (
+        np.hanning(TILE_PX).astype(np.float32)[:, None]
+        * np.hanning(TILE_PX).astype(np.float32)[None, :]
+    ) ** 2
+
+    for r in range(0, H + 1, stride):
+        for c in range(0, W + 1, stride):
+            # 端でクリップして常に TILE_PX × TILE_PX の完全タイルを使う
+            r0 = min(r, H - TILE_PX)
+            c0 = min(c, W - TILE_PX)
+
+            detail = details[rng.integers(len(details))]
+            canvas[r0:r0 + TILE_PX, c0:c0 + TILE_PX] += detail
+            wsum[r0:r0 + TILE_PX, c0:c0 + TILE_PX]   += win_sq
+
+    valid = wsum > 1e-6
+    canvas[valid] /= wsum[valid]
+    return canvas
 
 
 # ── 島マスク ─────────────────────────────────────────────────────────────────
 def make_island_mask(h: int, w: int, land_frac: float = 0.87,
                      roughness: int = 6, seed: int = 42) -> np.ndarray:
     """
-    有機的な輪郭の島マスク [0, 1] を返す。1 = 陸地、0 = 海。
+    有機的な輪郭の島マスク [0, 1] を生成する。
 
-    land_frac : 楕円の半径 / 画像の半幅。
-                5×5 グリッドで land_frac=0.87 ≈ 6000 km²。
-    roughness : 海岸線の凸凹レベル（大きいほどフィヨルドや半島が増える）。
+    手法: 楕円境界に低周波正弦波の重ね合わせで凸凹を加え、
+          sigmoid でソフトな海岸線にする。
+    land_frac=0.87 かつ ISLAND_KM=100km のとき:
+      楕円半径 ≈ 43.5km → 面積 ≈ π × 43.5² ≈ 5946 km²
     """
     rng = np.random.default_rng(seed)
     cy, cx = h / 2.0, w / 2.0
@@ -143,57 +200,54 @@ def make_island_mask(h: int, w: int, land_frac: float = 0.87,
     rx = (w / 2.0) * land_frac
 
     yy, xx = np.mgrid[0:h, 0:w]
-    dy = (yy - cy) / ry
-    dx = (xx - cx) / rx
-    theta = np.arctan2(dy, dx)           # [-π, π]
-    r_norm = np.sqrt(dx ** 2 + dy ** 2)  # 1.0 = 楕円境界
+    dy, dx = (yy - cy) / ry, (xx - cx) / rx
+    theta  = np.arctan2(dy, dx)
+    r_norm = np.sqrt(dx ** 2 + dy ** 2)
 
-    # 低周波正弦波を重ねて海岸線に凸凹をつける
+    # 低周波正弦波で海岸線に湾・半島を生成
     perturbation = np.zeros_like(theta)
     for k in range(1, roughness + 1):
         amp   = rng.uniform(0.04, 0.12) / k
-        phase = rng.uniform(0, 2 * np.pi)
+        phase = rng.uniform(0.0, 2.0 * np.pi)
         perturbation += amp * np.sin(k * theta + phase)
 
     boundary = 1.0 + perturbation
-
-    # sigmoid で海岸線をソフトマスク化（値が大きいほど急峻な崖）
-    coast_sharpness = 0.06
-    signed_dist = (boundary - r_norm) / coast_sharpness
-    mask = 1.0 / (1.0 + np.exp(-signed_dist))
-    return mask.astype(np.float32)
+    # coast_width が小さいほど急崖、大きいほど緩やかな浜辺
+    coast_width = 0.06
+    signed_dist = (boundary - r_norm) / coast_width
+    return (1.0 / (1.0 + np.exp(-signed_dist))).astype(np.float32)
 
 
 # ── メイン ──────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="StyleGAN2 地形モデルから ~6000 km² の島 heightmap を生成",
+        description="手続き的基盤 + AI テクスチャで ~6000 km² の島 heightmap を生成",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--network",     required=True,
-                    help="学習済みモデル (.pkl)")
-    ap.add_argument("--outdir",      default="images/island",
-                    help="出力ディレクトリ")
-    ap.add_argument("--seed-start",  type=int, default=0,
-                    help="タイル生成の先頭シード値")
-    ap.add_argument("--trunc",       type=float, default=0.7,
-                    help="Truncation psi (小さいほど典型的な地形)")
-    ap.add_argument("--grid-w",      type=int, default=5,
-                    help="横タイル数 (5 = 100 km)")
-    ap.add_argument("--grid-h",      type=int, default=5,
-                    help="縦タイル数 (5 = 100 km)")
-    ap.add_argument("--blend-width", type=int, default=64,
-                    help="シームブレンド幅 (px)")
-    ap.add_argument("--island-frac", type=float, default=0.87,
-                    help="島サイズ係数 (楕円半径 / 画像半幅)。"
-                         "5×5 グリッドで 0.87 ≈ 6000 km²")
-    ap.add_argument("--roughness",   type=int, default=6,
-                    help="海岸線の複雑さ (1〜10)")
-    ap.add_argument("--mask-seed",   type=int, default=42,
+    ap.add_argument("--network",
+                    help="学習済みモデル (.pkl)。--no-generate 時は省略可")
+    ap.add_argument("--outdir",       default="images/island")
+    ap.add_argument("--seed-start",   type=int,   default=0,
+                    help="AI タイル生成の先頭シード値")
+    ap.add_argument("--trunc",        type=float, default=0.7,
+                    help="truncation psi")
+    ap.add_argument("--n-tex",        type=int,   default=9,
+                    help="生成する AI テクスチャタイル数 (多いほど繰り返しが減る)")
+    ap.add_argument("--base-seed",    type=int,   default=0,
+                    help="手続き的基盤地形の乱数シード")
+    ap.add_argument("--tex-strength", type=float, default=0.30,
+                    help="AI テクスチャの加算強度 (0=手続き的のみ、0.5 で強め)")
+    ap.add_argument("--beta",         type=float, default=2.2,
+                    help="フラクタルスペクトル指数 (2.0=滑らか、2.5=険しい)")
+    ap.add_argument("--island-frac",  type=float, default=0.87,
+                    help="島サイズ係数 (楕円半径 / 画像半幅)")
+    ap.add_argument("--roughness",    type=int,   default=6,
+                    help="海岸線の複雑さ (1=円形、10=フィヨルド)")
+    ap.add_argument("--mask-seed",    type=int,   default=42,
                     help="島形状の乱数シード")
-    ap.add_argument("--no-generate", action="store_true",
-                    help="タイル生成をスキップして既存ファイルを使用")
-    ap.add_argument("--colorize",    action="store_true",
+    ap.add_argument("--no-generate",  action="store_true",
+                    help="AI タイル生成をスキップ（既存ファイルを使用）")
+    ap.add_argument("--colorize",     action="store_true",
                     help="カラー版 heightmap も生成")
     args = ap.parse_args()
 
@@ -201,79 +255,80 @@ def main():
     tile_dir = os.path.join(args.outdir, "tiles")
     os.makedirs(tile_dir, exist_ok=True)
 
-    n_tiles   = args.grid_w * args.grid_h
-    width_km  = args.grid_w * TILE_KM
-    height_km = args.grid_h * TILE_KM
-    approx_area = (np.pi
-                   * (width_km / 2 * args.island_frac)
-                   * (height_km / 2 * args.island_frac))
+    H = W = MAP_PX
+    approx_area = np.pi * (ISLAND_KM / 2 * args.island_frac) ** 2
 
-    print("=" * 50)
-    print(f"グリッド    : {args.grid_w}×{args.grid_h} タイル"
-          f" = {width_km}km × {height_km}km")
-    print(f"タイル枚数  : {n_tiles}")
-    print(f"島の概算面積: {approx_area:.0f} km²")
+    print("=" * 60)
+    print(f"出力サイズ  : {W}×{H} px = {ISLAND_KM}km × {ISLAND_KM}km")
     print(f"解像度      : {KM_PER_PX * 1000:.0f} m/px")
-    print("=" * 50)
+    print(f"島概算面積  : {approx_area:.0f} km²")
+    print(f"手法        : FFT フラクタル基盤 + AI テクスチャ (強度={args.tex_strength})")
+    print("=" * 60)
 
-    # 1) タイル生成
+    # Step 1: AI タイル生成
     if not args.no_generate:
-        generate_tiles(args.network, args.seed_start, n_tiles,
+        if not args.network:
+            ap.error("--network が必要です (--no-generate 未指定時)")
+        generate_tiles(args.network, args.seed_start, args.n_tex,
                        args.trunc, tile_dir)
     else:
-        print("タイル生成をスキップします。")
+        print("AI タイル生成をスキップします。")
 
-    # 2) タイル読み込み
-    print(f"\n{n_tiles} 枚のタイルを読み込み中...")
-    tiles = load_all_tiles(tile_dir, args.seed_start, n_tiles)
+    # Step 2: AI タイルから高周波テクスチャ詳細を抽出
+    print(f"\nAI テクスチャ詳細を抽出中 ({args.n_tex} 枚)...")
+    details = []
+    for i in range(args.n_tex):
+        path = os.path.join(tile_dir, f"seed{args.seed_start + i:04d}.png")
+        details.append(extract_windowed_detail(load_tile(path)))
+    print(f"  → {len(details)} 種類のテクスチャパターンを取得")
 
-    # 3) 縫い合わせ
-    print(f"タイルを縫い合わせ中 (blend_width={args.blend_width}px)...")
-    heightmap = stitch_tiles(tiles, args.grid_w, args.grid_h, args.blend_width)
-    h, w = heightmap.shape
-    print(f"縫い合わせ完了: {w}×{h} px")
+    # Step 3: 手続き的基盤地形 (空間的に一貫したフラクタルノイズ)
+    print(f"\n手続き的基盤地形を生成中 (seed={args.base_seed}, β={args.beta})...")
+    raw_base = fractal_terrain(H, W, seed=args.base_seed, beta=args.beta)
+    base = shape_island_base(raw_base, seed=args.base_seed)
+    print(f"  → {W}×{H} px の地形生成完了")
 
-    # 4) 島マスク生成 & 適用
-    print(f"島マスクを生成中 (roughness={args.roughness}, seed={args.mask_seed})...")
-    mask = make_island_mask(h, w,
+    # Step 4: AI テクスチャマップを全域に敷き詰める (シームレス)
+    print("AI テクスチャマップを生成中...")
+    texture = create_texture_map(details, H, W, seed=args.base_seed)
+    print(f"  → テクスチャ標準偏差: {texture.std():.4f}")
+
+    # Step 5: 基盤 + テクスチャ合成
+    print("合成中...")
+    combined = np.clip(base + args.tex_strength * texture, 0.0, 1.0)
+
+    # Step 6: 島マスク
+    print(f"島マスクを適用中 (roughness={args.roughness}, seed={args.mask_seed})...")
+    mask = make_island_mask(H, W,
                             land_frac=args.island_frac,
                             roughness=args.roughness,
                             seed=args.mask_seed)
+    MIN_LAND_HEIGHT = 0.01   # 最低標高 ~16m（海岸がゼロにならないように）
+    island = np.clip(combined * mask + MIN_LAND_HEIGHT * mask, 0.0, 1.0)
 
-    # 陸地には最低高さを確保（~16m）して島らしく、海は 0（海面）
-    MIN_LAND_HEIGHT = 0.01
-    island = np.clip(heightmap * mask + MIN_LAND_HEIGHT * mask, 0.0, 1.0)
-
-    # 5) 16bit PNG として保存
+    # Step 7: 16bit PNG 保存
     out_hm = os.path.join(args.outdir, "island_heightmap.png")
     Image.fromarray((island * 65535).astype(np.uint16)).save(out_hm)
 
-    # 陸地面積を計算
-    px_area_km2   = KM_PER_PX ** 2
-    land_px       = int((mask > 0.5).sum())
-    island_area   = land_px * px_area_km2
+    land_area_km2 = int((mask > 0.5).sum()) * KM_PER_PX ** 2
 
     print()
-    print("=" * 50)
+    print("=" * 60)
     print("完了!")
-    print(f"  出力       : {out_hm}")
-    print(f"  解像度     : {w}×{h} px"
-          f" ({w * KM_PER_PX:.1f}km × {h * KM_PER_PX:.1f}km)")
-    print(f"  陸地面積   : {island_area:.0f} km²")
-    print("=" * 50)
+    print(f"  出力     : {out_hm}")
+    print(f"  解像度   : {W}×{H} px")
+    print(f"  陸地面積 : {land_area_km2:.0f} km²")
+    print("=" * 60)
 
-    # 6) カラー版
+    # Step 8 (オプション): カラー版
     if args.colorize:
         color_out = out_hm.replace(".png", "_color.png")
         subprocess.run(
-            [
-                "python", "heightmap_colorize.py",
-                out_hm, color_out,
-                "--hillshade", "--hillshade-strength", "0.4",
-            ],
+            ["python", "heightmap_colorize.py", out_hm, color_out,
+             "--hillshade", "--hillshade-strength", "0.4"],
             check=True,
         )
-        print(f"カラー版   : {color_out}")
+        print(f"カラー版 : {color_out}")
 
 
 if __name__ == "__main__":
