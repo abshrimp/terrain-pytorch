@@ -1,20 +1,28 @@
-# Terrain Erosion 3 Ways
+# Terrain Generation Project
 
-このプロジェクトは [dandrino/terrain-erosion-3-ways](https://github.com/dandrino/terrain-erosion-3-ways.git) のクローンで、StyleGAN2を使用して地形生成を行うものです。
+StyleGAN2を使用して日本の地形を学習させ、地形生成を行うプロジェクトです。
 
-## データについて
-
-`raw_tiles/` ディレクトリには国土地理院のDEMから取得したデータが含まれています。
+[dandrino/terrain-erosion-3-ways](https://github.com/dandrino/terrain-erosion-3-ways.git) をめっちゃ参考にしています。
 
 ## セットアップ
 
 ### 必要なパッケージのインストール
 
 ```bash
-pip install -r requirements-pip3.txt
+pip install -r requirements.txt
 ```
 
-### StyleGAN2のクローン
+### データについて
+
+`raw_tiles/` ディレクトリには国土地理院のDEMから取得したデータが含まれています。
+
+`download_raw_tiles.py` を使用してデータを取得できます：
+
+```bash
+python download_raw_tiles.py
+```
+
+### StyleGAN2 のクローン
 
 このリポジトリには [NVlabs/stylegan2-ada-pytorch](https://github.com/NVlabs/stylegan2-ada-pytorch.git) のクローンが含まれています。
 
@@ -51,17 +59,9 @@ python stylegan2-ada-pytorch/train.py \
     --gpus=1 \
     --cfg=auto \
     --mirror=0 \
-    --snap=10
+    --snap=10 \
+    --metrics=none
 ```
-
-#### トレーニングパラメータの説明
-
-- `--outdir`: トレーニング結果の出力ディレクトリ
-- `--data`: 訓練データセットのパス
-- `--gpus`: 使用するGPUの数
-- `--cfg`: 自動的に設定を選択（`auto`）
-- `--mirror`: 水平反転の有効化（0=無効、1=有効）
-- `--snap`: スナップショットの保存間隔（Kimg単位）
 
 ## ライセンス
 
