@@ -7,3 +7,4 @@ imageio-ffmpeg==0.4.3
 numpy
 scikit-image
 Pillow
+opencv-python-headless

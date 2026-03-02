@@ -17,6 +17,7 @@ import dnnlib
 import numpy as np
 import PIL.Image
 import torch
+import cv2
 
 import legacy
 
@@ -117,8 +118,13 @@ def generate_images(
         print('Generating image for seed %d (%d/%d) ...' % (seed, seed_idx, len(seeds)))
         z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim)).to(device)
         img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode)
-        img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
-        PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
+
+        img_np = img[0].permute(1, 2, 0).cpu().numpy()
+        img_16 = ((img_np * 0.5 + 0.5) * 65535).clip(0, 65535).astype(np.uint16)
+        cv2.imwrite(f'{outdir}/seed{seed:04d}.png', cv2.cvtColor(img_16, cv2.COLOR_RGB2BGR))
+        
+        # img = (img.permute(0, 2, 3, 1) * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+        # PIL.Image.fromarray(img[0].cpu().numpy(), 'RGB').save(f'{outdir}/seed{seed:04d}.png')
 
 
 #----------------------------------------------------------------------------
