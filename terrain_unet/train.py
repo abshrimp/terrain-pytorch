@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-pix2pix 地形学習スクリプト
+pix2pix 地形学習スクリプト (GPU高速化版)
 
 training_samples/ の 16bit グレースケール PNG から、
-ランダムなガウシアンブラーで (smooth, detail) ペアを自動生成して学習します。
+GPU上でランダムなガウシアンブラーをかけて (smooth, detail) ペアを自動生成して学習します。
 
 使い方:
     # 基本 (MPS, workers=0 推奨)
@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import matplotlib
@@ -44,26 +45,19 @@ from terrain_unet.model import UNetGenerator, PatchDiscriminator, get_device
 class TerrainDataset(Dataset):
     """
     16bit グレースケール地形画像のデータセット。
-    __getitem__ でランダムなガウシアンブラーをかけ (smooth, detail) ペアを返す。
+    CPUでの重い処理を避け、画像読み込みと軽い拡張のみを行い detail を返します。
     """
-    def __init__(
-        self,
-        image_dir: str,
-        size: int = 512,
-        sigma_min: float = 5.0,
-        sigma_max: float = 60.0,
-    ):
+    def __init__(self, image_dir: str, size: int = 512):
         self.files = sorted(glob.glob(os.path.join(image_dir, "*.png")))
         assert len(self.files) > 0, f"PNG が見つかりません: {image_dir}"
         self.size = size
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        print(f"Dataset: {len(self.files)} 枚  sigma=[{sigma_min}, {sigma_max}]")
+        print(f"Dataset: {len(self.files)} 枚")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
+        # 毎回ディスクから読み込む (RAM 24GB環境での安全策)
         img = cv2.imread(self.files[idx], cv2.IMREAD_UNCHANGED)  # uint16 [H, W]
 
         # uint16 → float32 [-1, 1]
@@ -73,23 +67,16 @@ class TerrainDataset(Dataset):
         if img_f.shape[0] != self.size or img_f.shape[1] != self.size:
             img_f = cv2.resize(img_f, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
 
-        # ランダムなガウシアンブラー (強さを毎回変える)
-        sigma = random.uniform(self.sigma_min, self.sigma_max)
-        ksize = int(sigma * 6) | 1  # 奇数保証
-        smooth_f = cv2.GaussianBlur(img_f, (ksize, ksize), sigma)
-
         # データ拡張: 90°回転 + 水平フリップ
         k = random.randint(0, 3)
-        img_f    = np.rot90(img_f,    k).copy()
-        smooth_f = np.rot90(smooth_f, k).copy()
+        img_f = np.rot90(img_f, k).copy()
         if random.random() > 0.5:
-            img_f    = img_f[:, ::-1].copy()
-            smooth_f = smooth_f[:, ::-1].copy()
+            img_f = img_f[:, ::-1].copy()
 
         # [H, W] → [1, H, W] tensor
+        # detailのみを返す (smoothはGPUで作る)
         detail = torch.from_numpy(img_f[None]).float()
-        smooth = torch.from_numpy(smooth_f[None]).float()
-        return smooth, detail
+        return detail
 
 
 # ----------------------------------------------------------------
@@ -125,12 +112,12 @@ def save_sample(G, device, sample_smooth, sample_detail, path):
 @click.option("--datadir",    default="training_samples",         show_default=True, help="学習画像ディレクトリ")
 @click.option("--outdir",     default="terrain_unet/checkpoints", show_default=True, help="チェックポイント保存先")
 @click.option("--epochs",     default=200,  show_default=True, type=int,   help="総エポック数")
-@click.option("--batch",      default=4,    show_default=True, type=int,   help="バッチサイズ (RTX 4090 なら 8〜16)")
+@click.option("--batch",      default=4,    show_default=True, type=int,   help="バッチサイズ")
 @click.option("--lr",         default=2e-4, show_default=True, type=float, help="初期学習率")
 @click.option("--lambda-l1",  default=100.0,show_default=True, type=float, help="L1 損失の重み")
 @click.option("--no-gan",     is_flag=True, default=False, help="GAN なし (L1 損失のみ, より安定)")
 @click.option("--amp",        is_flag=True, default=False, help="AMP (混合精度) 使用 [CUDA のみ]")
-@click.option("--workers",    default=4,    show_default=True, type=int,   help="DataLoader ワーカー数 (MPS では 0 推奨)")
+@click.option("--workers",    default=4,    show_default=True, type=int,   help="DataLoader ワーカー数")
 @click.option("--ngf",        default=64,   show_default=True, type=int,   help="Generator ベースチャンネル数")
 @click.option("--resume",     default=None, metavar="FILE",               help="チェックポイントから再開")
 @click.option("--save-every", default=10,   show_default=True, type=int,   help="N エポックごとにチェックポイント保存")
@@ -151,7 +138,7 @@ def train(
         print("AMP は CUDA のみ有効。スキップします。")
 
     # --- データ ---
-    dataset = TerrainDataset(datadir, sigma_min=sigma_min, sigma_max=sigma_max)
+    dataset = TerrainDataset(datadir)
     loader = DataLoader(
         dataset,
         batch_size=batch,
@@ -163,8 +150,16 @@ def train(
     )
     print(f"バッチ数/エポック: {len(loader)}")
 
-    # 進捗可視化用のサンプルを固定
-    sample_smooth, sample_detail = next(iter(DataLoader(dataset, batch_size=4, shuffle=True)))
+    # --- 進捗可視化用のサンプルを固定 ---
+    # detailのみ取得してGPUへ
+    sample_detail = next(iter(DataLoader(dataset, batch_size=4, shuffle=True)))
+    sample_detail = sample_detail.to(device)
+    
+    # サンプル用の smooth を一度だけ作っておく
+    sample_sigma = (sigma_min + sigma_max) / 2.0
+    sample_ksize = int(sample_sigma * 6) | 1
+    sample_smooth = TF.gaussian_blur(sample_detail, kernel_size=[sample_ksize, sample_ksize], sigma=[sample_sigma, sample_sigma]).cpu()
+    sample_detail = sample_detail.cpu()
 
     # --- モデル ---
     G = UNetGenerator(in_ch=1, out_ch=1, ngf=ngf).to(device)
@@ -220,9 +215,13 @@ def train(
         sum_D = 0.0
 
         batch_bar = tqdm(loader, desc=f"  Ep {epoch+1:>4d}", leave=False, unit="batch")
-        for i, (smooth, detail) in enumerate(batch_bar):
-            smooth = smooth.to(device)
+        for i, detail in enumerate(batch_bar):
             detail = detail.to(device)
+
+            # --- GPU上でガウシアンブラーを適用 ---
+            sigma = random.uniform(sigma_min, sigma_max)
+            ksize = int(sigma * 6) | 1  # 奇数保証
+            smooth = TF.gaussian_blur(detail, kernel_size=[ksize, ksize], sigma=[sigma, sigma])
 
             # ---- Discriminator ----
             if D:
