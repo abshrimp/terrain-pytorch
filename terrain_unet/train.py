@@ -158,7 +158,7 @@ def train(
         shuffle=True,
         num_workers=workers,
         pin_memory=(str(device) == "cuda"),
-        persistent_workers=(workers > 0),
+        persistent_workers=False,
         drop_last=True,
     )
     print(f"バッチ数/エポック: {len(loader)}")
