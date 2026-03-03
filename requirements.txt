@@ -9,4 +9,3 @@ scikit-image
 Pillow
 opencv-python-headless
 matplotlib
-scipy
