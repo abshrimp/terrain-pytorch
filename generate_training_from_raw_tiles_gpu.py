@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-generate_training_from_raw_tiles.py (究極高速化版)
+generate_training_from_raw_tiles.py (究極高速化版・修正済み)
 
 - ProcessPoolExecutorによる完全マルチプロセス化 (GIL回避)
 - PNG低圧縮保存によるCPU負荷軽減
-- GPUヒストグラムを用いた超高速エントロピー計算
+- GPU上で正確なシャノンエントロピー計算（バグ修正済）
 """
 
 import os
@@ -106,14 +106,8 @@ def load_patch_cpu(tile_map, x0, y0):
     return patch
 
 def gpu_shannon_entropy(patch_cp):
-    """【最適化】unique(ソート処理)を避け、ヒストグラムで近似計算"""
-    p_min, p_max = float(patch_cp.min()), float(patch_cp.max())
-    if p_min == p_max:
-        return 0.0
-    
-    # 256階調のヒストグラムを作成（一瞬で終わる）
-    counts, _ = cp.histogram(patch_cp, bins=256, range=(p_min, p_max))
-    counts = counts[counts > 0]
+    """元の skimage 互換の計算（正確なエントロピーを算出）"""
+    _, counts = cp.unique(patch_cp, return_counts=True)
     p = counts / counts.sum()
     return -cp.sum(p * cp.log2(p))
 
@@ -148,7 +142,7 @@ def get_variants_gpu(a_cp):
 
 def save_png_from_gpu(a_cp, path):
     a_np = cp.asnumpy(a_cp)
-    # 【最適化】compress_level=1 を指定してPNG圧縮のCPU計算を大幅にカット
+    # compress_level=1 を指定してPNG圧縮のCPU計算を大幅にカット
     Image.fromarray(np.round(a_np * 65535).astype(np.uint16)).save(path, compress_level=1)
 
 # -------------------------------------------------------- ワーカー処理 --
@@ -214,7 +208,7 @@ def main():
         
         print(f'  マルチプロセス({MAX_WORKERS}プロセス)で処理を開始します...')
         
-        # 【最適化】マルチプロセスでCUDAを安全に使うために 'spawn' コンテキストを使用
+        # マルチプロセスでCUDAを安全に使うために 'spawn' コンテキストを使用
         ctx = mp.get_context('spawn')
         
         with tqdm(total=total_candidates, unit='patch', desc=f'z={z}') as pbar:
