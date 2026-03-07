@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-generate_training_from_raw_tiles.py (GPU + マルチスレッド高速化版)
+generate_training_from_raw_tiles.py (究極高速化版)
 
-- CuPyを使用して計算（フィルタリング、正規化、データ拡張）をGPUへオフロード
-- concurrent.futuresを用いてI/O（ファイル読み書き）とGPU処理を並列化
+- ProcessPoolExecutorによる完全マルチプロセス化 (GIL回避)
+- PNG低圧縮保存によるCPU負荷軽減
+- GPUヒストグラムを用いた超高速エントロピー計算
 """
 
 import os
@@ -13,6 +14,7 @@ import cupy as cp
 from PIL import Image
 from tqdm import tqdm
 import concurrent.futures
+import multiprocessing as mp
 
 # ------------------------------------------------------------------ 設定 --
 
@@ -23,12 +25,10 @@ MISSING_VALUE = -9999.0
 TILE_SIZE     = 256
 SAMPLE_SIZE   = TILE_SIZE * 2   # = 512
 
-# フィルタリング閾値
-MIN_ELEV_RANGE    = 40.0   # [m] 最大-最小がこれ未満 → 平坦すぎて除外
-MAX_NEAR_MIN_FRAC = 0.20   # 最小値付近のピクセル割合がこれ超 → 水域として除外
-MIN_ENTROPY       = 10.0   # Shannon entropy がこれ未満 → データ異常として除外
+MIN_ELEV_RANGE    = 40.0
+MAX_NEAR_MIN_FRAC = 0.20
+MIN_ENTROPY       = 10.0
 
-# ブラックリスト
 BLACKLIST = {
     12: [
         {"name": "富士山",         "x_range": (3624, 3628), "y_range": (1615, 1620)},
@@ -88,7 +88,6 @@ def load_tile_index(tiles_dir):
     return by_zoom
 
 def load_patch_cpu(tile_map, x0, y0):
-    """CPU(NumPy)で2x2のタイルを読み込み、512x512のパッチを組み立てる"""
     patch = np.empty((SAMPLE_SIZE, SAMPLE_SIZE), dtype=np.float32)
     for dx, dy in [(0, 0), (1, 0), (0, 1), (1, 1)]:
         key = (x0 + dx, y0 + dy)
@@ -107,14 +106,18 @@ def load_patch_cpu(tile_map, x0, y0):
     return patch
 
 def gpu_shannon_entropy(patch_cp):
-    """CuPyを使用してGPU上でシャノンエントロピーを計算する"""
-    _, counts = cp.unique(patch_cp, return_counts=True)
+    """【最適化】unique(ソート処理)を避け、ヒストグラムで近似計算"""
+    p_min, p_max = float(patch_cp.min()), float(patch_cp.max())
+    if p_min == p_max:
+        return 0.0
+    
+    # 256階調のヒストグラムを作成（一瞬で終わる）
+    counts, _ = cp.histogram(patch_cp, bins=256, range=(p_min, p_max))
+    counts = counts[counts > 0]
     p = counts / counts.sum()
     return -cp.sum(p * cp.log2(p))
 
 def clean_sample_gpu(patch_np):
-    """GPU(CuPy)上でフィルタリングと正規化を行う"""
-    # CPUからGPUへデータを転送
     patch = cp.asarray(patch_np)
 
     elev_range = float(patch.max() - patch.min())
@@ -139,38 +142,31 @@ def clean_sample_gpu(patch_np):
     return patch / MAX_ELEV
 
 def get_variants_gpu(a_cp):
-    """GPU(CuPy)配列上でデータ拡張(回転・反転)を行う"""
     for b in (a_cp, a_cp.T):
         for k in range(4):
             yield cp.rot90(b, k)
 
 def save_png_from_gpu(a_cp, path):
-    """GPU(CuPy)配列をCPU(NumPy)に戻してPNGとして保存する"""
     a_np = cp.asnumpy(a_cp)
-    Image.fromarray(np.round(a_np * 65535).astype(np.uint16)).save(path)
-
+    # 【最適化】compress_level=1 を指定してPNG圧縮のCPU計算を大幅にカット
+    Image.fromarray(np.round(a_np * 65535).astype(np.uint16)).save(path, compress_level=1)
 
 # -------------------------------------------------------- ワーカー処理 --
 
 def process_single_patch(args):
-    """1つのパッチに対する 読み込み(CPU) -> 処理(GPU) -> 保存(CPU) を一貫して行う"""
     x, y, tile_map, blacklisted_tiles, current_id = args
 
-    # 1. ブラックリスト判定
     if is_blacklisted(x, y, blacklisted_tiles):
         return 'blacklist', 0
 
-    # 2. CPUでデータを読み込み・結合 (I/O処理)
     patch_np = load_patch_cpu(tile_map, x, y)
     if patch_np is None:
         return 'missing', 0
 
-    # 3. GPUでフィルタリング＆正規化 (Compute処理)
     cleaned_cp = clean_sample_gpu(patch_np)
     if cleaned_cp is None:
         return 'filter', 0
 
-    # 4. GPUでバリエーション生成 -> CPUに戻して保存 (Compute & I/O処理)
     saved_count = 0
     for i, variant_cp in enumerate(get_variants_gpu(cleaned_cp)):
         save_path = os.path.join(OUTPUT_DIR, f'{current_id + i}.png')
@@ -190,8 +186,8 @@ def main():
         print(f'エラー: {RAW_TILES_DIR} にタイルが見つかりません')
         return
 
-    # 並行処理用のスレッド数 (I/O待ちが長いため、CPUコア数より多めが有効)
-    MAX_WORKERS = 16 
+    # CPUのコア数に応じて調整（推奨：論理コア数と同じか少し少なめ）
+    MAX_WORKERS = max(1, os.cpu_count() - 2)
 
     for z in sorted(by_zoom):
         tile_map = by_zoom[z]
@@ -207,26 +203,24 @@ def main():
         skip_blacklist = 0
         skip_filter = 0
 
-        # タスク(引数)のリスト作成
-        # 並列処理時にファイル名(ID)が被らないよう、事前に候補ごとにIDを割り当てておく
-        # ※除外された候補の分だけファイル番号が飛びますが、学習データとしては問題ありません。
         tasks = []
         training_id = 0
         for x in xs:
             for y in ys:
                 tasks.append((x, y, tile_map, blacklisted_tiles, training_id))
-                training_id += 8  # 1候補につき最大8枚生成されるため
+                training_id += 8
 
         total_candidates = len(tasks)
         
-        print(f'  マルチスレッド({MAX_WORKERS}スレッド)で処理を開始します...')
+        print(f'  マルチプロセス({MAX_WORKERS}プロセス)で処理を開始します...')
+        
+        # 【最適化】マルチプロセスでCUDAを安全に使うために 'spawn' コンテキストを使用
+        ctx = mp.get_context('spawn')
         
         with tqdm(total=total_candidates, unit='patch', desc=f'z={z}') as pbar:
-            # スレッドプールによる並列実行
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_WORKERS, mp_context=ctx) as executor:
                 futures = [executor.submit(process_single_patch, task) for task in tasks]
                 
-                # 終わったタスクから順次結果を受け取る
                 for future in concurrent.futures.as_completed(futures):
                     result_type, _ = future.result()
                     
@@ -251,4 +245,6 @@ def main():
     print(f'\n完了。トレーニング画像を {OUTPUT_DIR}/ に書き出しました。')
 
 if __name__ == '__main__':
+    # Windows等の環境でマルチプロセスを正常に動かすためのおまじない
+    mp.freeze_support()
     main()
