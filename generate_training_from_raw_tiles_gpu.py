@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
-
 import os
 import re
 import numpy as np
-import torch
+import cupy as cp  # 追加: GPU処理用ライブラリ
 from PIL import Image
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
-import multiprocessing as mp
 
-RAW_TILES_DIR = "./raw_tiles"
-OUTPUT_DIR = "./training_samples"
+# ------------------------------------------------------------------ 設定 --
 
-TILE_SIZE = 256
-SAMPLE_SIZE = TILE_SIZE * 2
+RAW_TILES_DIR = './raw_tiles'
+OUTPUT_DIR    = './training_samples'
 
-MIN_ELEV_RANGE = 40.0
+MISSING_VALUE = -9999.0
+TILE_SIZE     = 256
+SAMPLE_SIZE   = TILE_SIZE * 2   # = 512
+
+MIN_ELEV_RANGE    = 40.0
 MAX_NEAR_MIN_FRAC = 0.20
-MIN_ENTROPY = 10.0
-MAX_ELEV = 1600.0
-
-NUM_WORKERS = os.cpu_count()
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+MIN_ENTROPY       = 10.0
 
 BLACKLIST = {
     12: [
@@ -53,187 +47,176 @@ BLACKLIST = {
     ],
 }
 
+# ------------------------------------------------------------------ 関数 --
 
 def build_blacklist_tileset(areas):
-    blacklisted=set()
+    blacklisted = set()
     for area in areas:
-        x0,x1=area["x_range"]
-        y0,y1=area["y_range"]
-        for x in range(x0,x1+1):
-            for y in range(y0,y1+1):
-                blacklisted.add((x,y))
+        x0_bl, x1_bl = area['x_range']
+        y0_bl, y1_bl = area['y_range']
+        for bx in range(x0_bl, x1_bl + 1):
+            for by in range(y0_bl, y1_bl + 1):
+                blacklisted.add((bx, by))
     return blacklisted
 
-
-def is_blacklisted(x0,y0,blacklisted):
-    for tx in (x0,x0+1):
-        for ty in (y0,y0+1):
-            if (tx,ty) in blacklisted:
+def is_blacklisted(x0, y0, blacklisted_tiles):
+    for tx in (x0, x0 + 1):
+        for ty in (y0, y0 + 1):
+            if (tx, ty) in blacklisted_tiles:
                 return True
     return False
 
-
-def load_tile_index(dir):
-    pattern=re.compile(r'^(\d+)_(\d+)_(\d+)\.npy$')
-    by_zoom={}
-    for fname in os.listdir(dir):
-        m=pattern.match(fname)
+def load_tile_index(tiles_dir):
+    pattern = re.compile(r'^(\d+)_(\d+)_(\d+)\.npy$')
+    by_zoom = {}
+    for fname in sorted(os.listdir(tiles_dir)):
+        m = pattern.match(fname)
         if not m:
             continue
-        z,x,y=map(int,m.groups())
-        by_zoom.setdefault(z,{})[(x,y)] = os.path.join(dir,fname)
+        z, x, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        by_zoom.setdefault(z, {})[(x, y)] = os.path.join(tiles_dir, fname)
     return by_zoom
 
-
-def load_patch_cpu(tile_map,x0,y0):
-    patch=np.empty((SAMPLE_SIZE,SAMPLE_SIZE),dtype=np.float32)
-
-    for dx,dy in [(0,0),(1,0),(0,1),(1,1)]:
-        key=(x0+dx,y0+dy)
+def load_patch_cpu(tile_map, x0, y0):
+    """
+    I/O処理はCPU（NumPy）で行い、512x512の配列を組み立ててからGPUに送る方が
+    転送効率が良いため、ここはNumPyのままにします。
+    """
+    patch = np.empty((SAMPLE_SIZE, SAMPLE_SIZE), dtype=np.float32)
+    for dx, dy in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+        key = (x0 + dx, y0 + dy)
         if key not in tile_map:
             return None
-
         try:
-            tile=np.load(tile_map[key],mmap_mode="r")
-        except:
+            tile = np.load(tile_map[key]).astype(np.float32)
+        except Exception:
             return None
-
-        if tile.shape!=(TILE_SIZE,TILE_SIZE):
+        if tile.shape != (TILE_SIZE, TILE_SIZE):
             return None
-
-        tile=np.clip(tile,0,None)
-
-        r=dy*TILE_SIZE
-        c=dx*TILE_SIZE
-
-        patch[r:r+TILE_SIZE,c:c+TILE_SIZE]=tile
-
+        
+        np.clip(tile, 0.0, None, out=tile)
+        r, c = dy * TILE_SIZE, dx * TILE_SIZE
+        patch[r:r + TILE_SIZE, c:c + TILE_SIZE] = tile
     return patch
 
+def gpu_shannon_entropy(patch_cp):
+    """CuPyを使用してGPU上でシャノンエントロピーを計算する"""
+    _, counts = cp.unique(patch_cp, return_counts=True)
+    p = counts / counts.sum()
+    # 0が含まれることはない（uniqueでカウントされた要素のみのため）
+    return -cp.sum(p * cp.log2(p))
 
-def worker_task(args):
-    tile_map,x,y,blacklisted=args
+def clean_sample_gpu(patch_np):
+    """
+    NumPy配列を受け取り、GPU(CuPy)上でフィルタリングと正規化を行う。
+    不適切な場合は None を返し、適切な場合は CuPy配列 を返す。
+    """
+    # 1回の大きなチャンクとしてGPUへ転送
+    patch = cp.asarray(patch_np)
 
-    if is_blacklisted(x,y,blacklisted):
-        return None
-
-    patch=load_patch_cpu(tile_map,x,y)
-
-    return patch
-
-
-def clean_sample_gpu(patch):
-
-    patch=torch.from_numpy(patch).to(DEVICE)
-
-    elev_range=(patch.max()-patch.min()).item()
+    elev_range = float(patch.max() - patch.min())
     if elev_range < MIN_ELEV_RANGE:
         return None
 
-    near_min_frac=((patch < patch.min()+8).float().mean()).item()
+    near_min_frac = float((patch < patch.min() + 8.0).sum()) / patch.size
     if near_min_frac > MAX_NEAR_MIN_FRAC:
         return None
 
-    hist=torch.histc(patch,bins=256,min=0,max=3000)
-    p=hist/hist.sum()
-    entropy=-(p*torch.log2(p+1e-12)).sum().item()
-
-    if entropy < MIN_ENTROPY:
+    if gpu_shannon_entropy(patch) < MIN_ENTROPY:
         return None
 
-    p_max=patch.max()
-
+    MAX_ELEV = 1600.0
+    p_max = float(patch.max())
     if p_max > MAX_ELEV:
+        patch = patch - (p_max - MAX_ELEV)
+        p_min = float(patch.min())
+        if p_min < 0.0:
+            patch = (patch - p_min) / (MAX_ELEV - p_min) * MAX_ELEV
+            
+    return patch / MAX_ELEV
 
-        patch=patch-(p_max-MAX_ELEV)
-
-        p_min=patch.min()
-
-        if p_min < 0:
-            patch=(patch-p_min)/(MAX_ELEV-p_min)*MAX_ELEV
-
-    return patch/MAX_ELEV
-
-
-def get_variants(a):
-
-    variants=[]
-
-    for b in (a,a.T):
+def get_variants_gpu(a_cp):
+    """GPU(CuPy)配列上でデータ拡張を行う"""
+    for b in (a_cp, a_cp.T):
         for k in range(4):
-            variants.append(torch.rot90(b,k,[0,1]))
+            yield cp.rot90(b, k)
 
-    return variants
+def save_png_from_gpu(a_cp, path):
+    """GPU(CuPy)配列をCPU(NumPy)に戻してPNGとして保存する"""
+    # 保存の直前にCPUへデータを戻す
+    a_np = cp.asnumpy(a_cp)
+    Image.fromarray(np.round(a_np * 65535).astype(np.uint16)).save(path)
 
-
-def save_png(a,path):
-
-    a=a.cpu().numpy()
-
-    img=np.round(a*65535).astype(np.uint16)
-
-    Image.fromarray(img).save(path)
-
+# --------------------------------------------------------------------- main --
 
 def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    os.makedirs(OUTPUT_DIR,exist_ok=True)
+    by_zoom = load_tile_index(RAW_TILES_DIR)
+    if not by_zoom:
+        print(f'エラー: {RAW_TILES_DIR} にタイルが見つかりません')
+        return
 
-    by_zoom=load_tile_index(RAW_TILES_DIR)
-
-    training_id=0
+    training_id = 0
 
     for z in sorted(by_zoom):
+        tile_map = by_zoom[z]
+        xs = sorted({x for x, _ in tile_map})
+        ys = sorted({y for _, y in tile_map})
+        print(f'\nズームレベル {z}: {len(tile_map)} タイル  '
+              f'x=[{xs[0]}..{xs[-1]}]  y=[{ys[0]}..{ys[-1]}]')
 
-        tile_map=by_zoom[z]
+        blacklisted_tiles = build_blacklist_tileset(BLACKLIST.get(z, []))
+        print(f'  ブラックリスト: {len(BLACKLIST.get(z, []))} エリア '
+              f'({len(blacklisted_tiles)} タイル)')
 
-        xs=sorted({x for x,_ in tile_map})
-        ys=sorted({y for _,y in tile_map})
+        accepted        = 0
+        skip_missing    = 0
+        skip_blacklist  = 0
+        skip_filter     = 0
 
-        print(f"\nzoom {z} tiles {len(tile_map)}")
+        total_candidates = len(xs) * len(ys)
+        with tqdm(total=total_candidates, unit='patch', desc=f'z={z}') as pbar:
+            for x in xs:
+                for y in ys:
+                    if is_blacklisted(x, y, blacklisted_tiles):
+                        skip_blacklist += 1
+                        pbar.update(1)
+                        continue
 
-        blacklisted=build_blacklist_tileset(BLACKLIST.get(z,[]))
+                    # 1. CPUでデータを読み込み・結合
+                    patch_np = load_patch_cpu(tile_map, x, y)
+                    if patch_np is None:
+                        skip_missing += 1
+                        pbar.update(1)
+                        continue
 
-        candidates=[]
+                    # 2. GPUでフィルタリング＆正規化
+                    cleaned_cp = clean_sample_gpu(patch_np)
+                    if cleaned_cp is None:
+                        skip_filter += 1
+                        pbar.update(1)
+                        continue
 
-        for x in xs:
-            for y in ys:
-                candidates.append((tile_map,x,y,blacklisted))
+                    # 3. GPUでバリエーション生成 -> CPUに戻して保存
+                    for variant_cp in get_variants_gpu(cleaned_cp):
+                        save_png_from_gpu(
+                            variant_cp,
+                            os.path.join(OUTPUT_DIR, f'{training_id}.png')
+                        )
+                        training_id += 1
+                        
+                    accepted += 1
+                    pbar.update(1)
+                    pbar.set_postfix(accepted=accepted, images=training_id)
 
-        with ProcessPoolExecutor(NUM_WORKERS) as executor:
+        print(f'  候補パッチ数        : {total_candidates}')
+        print(f'  採用                : {accepted}  ({accepted * 8} 枚、×8バリエーション込み)')
+        print(f'  除外(タイル欠損)    : {skip_missing}')
+        print(f'  除外(ブラックリスト): {skip_blacklist}')
+        print(f'  除外(フィルタ)      : {skip_filter}')
 
-            for patch in tqdm(
-                executor.map(worker_task,candidates),
-                total=len(candidates)
-            ):
+    print(f'\n完了。{training_id} 枚のトレーニング画像を {OUTPUT_DIR}/ に書き出しました。')
 
-                if patch is None:
-                    continue
-
-                cleaned=clean_sample_gpu(patch)
-
-                if cleaned is None:
-                    continue
-
-                variants=get_variants(cleaned)
-
-                for v in variants:
-
-                    path=os.path.join(
-                        OUTPUT_DIR,
-                        f"{training_id}.png"
-                    )
-
-                    save_png(v,path)
-
-                    training_id+=1
-
-    print("\ncompleted")
-    print("images:",training_id)
-
-
-if __name__=="__main__":
-
-    mp.set_start_method("spawn",force=True)
-
+if __name__ == '__main__':
     main()
