@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Terrain Editor</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  header {
+    background: #16213e;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    border-bottom: 1px solid #0f3460;
+    flex-shrink: 0;
+  }
+  header h1 { font-size: 14px; font-weight: 600; color: #4fc3f7; letter-spacing: 1px; }
+  .main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+  .canvas-wrap {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #0d1117;
+    position: relative;
+    overflow: hidden;
+  }
+  #canvas {
+    image-rendering: pixelated;
+    cursor: crosshair;
+    border: 1px solid #0f3460;
+    display: block;
+  }
+  #overlay {
+    position: absolute;
+    top: 0; left: 0;
+    pointer-events: none;
+  }
+  .sidebar {
+    width: 220px;
+    background: #16213e;
+    border-left: 1px solid #0f3460;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .section {
+    padding: 12px;
+    border-bottom: 1px solid #0f3460;
+  }
+  .section-title {
+    font-size: 10px;
+    font-weight: 700;
+    color: #4fc3f7;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    margin-bottom: 10px;
+  }
+  .tools {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .tool-btn {
+    background: #0f3460;
+    border: 1px solid #1a4a8a;
+    border-radius: 6px;
+    color: #c0d0e0;
+    padding: 8px 4px;
+    cursor: pointer;
+    font-size: 11px;
+    text-align: center;
+    transition: all 0.15s;
+    line-height: 1.4;
+  }
+  .tool-btn:hover { background: #1a5276; border-color: #4fc3f7; }
+  .tool-btn.active { background: #1a6896; border-color: #4fc3f7; color: #fff; }
+  .tool-icon { font-size: 16px; display: block; margin-bottom: 2px; }
+  .slider-row {
+    margin-bottom: 10px;
+  }
+  .slider-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #90a4ae;
+    margin-bottom: 4px;
+  }
+  .slider-label span { color: #e0e0e0; font-weight: 600; }
+  input[type=range] {
+    width: 100%;
+    -webkit-appearance: none;
+    height: 4px;
+    background: #0f3460;
+    border-radius: 2px;
+    outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #4fc3f7;
+    cursor: pointer;
+  }
+  .btn {
+    width: 100%;
+    background: #0f3460;
+    border: 1px solid #1a4a8a;
+    border-radius: 6px;
+    color: #c0d0e0;
+    padding: 8px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: all 0.15s;
+    margin-bottom: 6px;
+  }
+  .btn:hover { background: #1a5276; border-color: #4fc3f7; color: #fff; }
+  .btn.danger { border-color: #c0392b; }
+  .btn.danger:hover { background: #922b21; border-color: #e74c3c; }
+  .info-row {
+    font-size: 10px;
+    color: #546e7a;
+    margin-bottom: 3px;
+  }
+  .info-row span { color: #90a4ae; }
+  .shortcut-list {
+    font-size: 10px;
+    color: #546e7a;
+    line-height: 1.8;
+  }
+  .shortcut-list kbd {
+    background: #0f3460;
+    border: 1px solid #1a4a8a;
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 9px;
+    color: #90a4ae;
+  }
+  .gradient-mode {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 10px;
+  }
+  .grad-btn {
+    flex: 1;
+    font-size: 10px;
+    padding: 4px;
+    background: #0f3460;
+    border: 1px solid #1a4a8a;
+    border-radius: 4px;
+    color: #90a4ae;
+    cursor: pointer;
+    text-align: center;
+  }
+  .grad-btn.active { background: #1a6896; border-color: #4fc3f7; color: #fff; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>TERRAIN EDITOR</h1>
+  <span style="font-size:11px;color:#546e7a;">256 x 256 heightmap</span>
+  <span id="coords" style="font-size:11px;color:#546e7a;margin-left:auto;"></span>
+  <span id="height-val" style="font-size:11px;color:#90a4ae;"></span>
+</header>
+
+<div class="main">
+  <div class="canvas-wrap" id="canvas-wrap">
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <div class="sidebar">
+    <!-- TOOLS -->
+    <div class="section">
+      <div class="section-title">Tools</div>
+      <div class="tools">
+        <button class="tool-btn active" data-tool="raise">
+          <span class="tool-icon">▲</span>Raise
+        </button>
+        <button class="tool-btn" data-tool="lower">
+          <span class="tool-icon">▼</span>Lower
+        </button>
+        <button class="tool-btn" data-tool="smooth">
+          <span class="tool-icon">~</span>Smooth
+        </button>
+        <button class="tool-btn" data-tool="flatten">
+          <span class="tool-icon">—</span>Flatten
+        </button>
+        <button class="tool-btn" data-tool="noise">
+          <span class="tool-icon">*</span>Noise
+        </button>
+        <button class="tool-btn" data-tool="sample">
+          <span class="tool-icon">+</span>Sample
+        </button>
+      </div>
+    </div>
+
+    <!-- BRUSH -->
+    <div class="section">
+      <div class="section-title">Brush</div>
+      <div class="slider-row">
+        <div class="slider-label">Size <span id="brush-size-val">30</span>px</div>
+        <input type="range" id="brush-size" min="2" max="100" value="30">
+      </div>
+      <div class="slider-row">
+        <div class="slider-label">Strength <span id="brush-str-val">30</span>%</div>
+        <input type="range" id="brush-str" min="1" max="100" value="30">
+      </div>
+      <div class="slider-row">
+        <div class="slider-label">Hardness <span id="brush-hard-val">50</span>%</div>
+        <input type="range" id="brush-hard" min="0" max="100" value="50">
+      </div>
+      <div class="slider-row" id="flatten-target-row" style="display:none;">
+        <div class="slider-label">Target <span id="flatten-val">50</span>%</div>
+        <input type="range" id="flatten-target" min="0" max="100" value="50">
+      </div>
+    </div>
+
+    <!-- VIEW -->
+    <div class="section">
+      <div class="section-title">View</div>
+      <div class="gradient-mode">
+        <div class="grad-btn active" data-view="terrain">Terrain</div>
+        <div class="grad-btn" data-view="gray">Gray</div>
+        <div class="grad-btn" data-view="topo">Topo</div>
+      </div>
+    </div>
+
+    <!-- HISTORY -->
+    <div class="section">
+      <div class="section-title">History</div>
+      <button class="btn" id="undo-btn">Undo  (Ctrl+Z)</button>
+      <button class="btn" id="redo-btn">Redo  (Ctrl+Y)</button>
+    </div>
+
+    <!-- GENERATE -->
+    <div class="section">
+      <div class="section-title">Generate</div>
+      <button class="btn" id="gen-perlin">Perlin Noise</button>
+      <button class="btn" id="gen-island">Island</button>
+      <button class="btn danger" id="gen-clear">Clear (flat)</button>
+    </div>
+
+    <!-- EXPORT -->
+    <div class="section">
+      <div class="section-title">Export</div>
+      <button class="btn" id="export-preview">Save Preview PNG</button>
+      <button class="btn" id="export-gray">Save Heightmap PNG</button>
+    </div>
+
+    <!-- INFO -->
+    <div class="section">
+      <div class="section-title">Info</div>
+      <div class="info-row">Pos: <span id="info-pos">—</span></div>
+      <div class="info-row">Height: <span id="info-height">—</span></div>
+      <div class="info-row">Undo stack: <span id="info-undo">0</span></div>
+    </div>
+
+    <!-- SHORTCUTS -->
+    <div class="section">
+      <div class="section-title">Shortcuts</div>
+      <div class="shortcut-list">
+        <kbd>[</kbd> / <kbd>]</kbd> brush size<br>
+        <kbd>1</kbd>–<kbd>6</kbd> select tool<br>
+        <kbd>Ctrl+Z</kbd> undo<br>
+        <kbd>Ctrl+Y</kbd> redo<br>
+        <kbd>Space</kbd> toggle view<br>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== CONFIG ====================
+const W = 256, H = 256;
+const DISPLAY = 512;
+
+// ==================== STATE ====================
+let heightmap = new Float32Array(W * H); // 0..1
+let tool = 'raise';
+let brushSize = 30;
+let brushStr = 0.30;
+let brushHard = 0.50;
+let flattenTarget = 0.5;
+let sampledHeight = 0.5;
+let viewMode = 'terrain';
+let painting = false;
+let undoStack = [];
+let redoStack = [];
+const MAX_UNDO = 40;
+
+// ==================== CANVAS ====================
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = DISPLAY;
+canvas.height = DISPLAY;
+canvas.style.width = DISPLAY + 'px';
+canvas.style.height = DISPLAY + 'px';
+
+// Fit canvas in container
+function fitCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const scale = Math.min(w / DISPLAY, h / DISPLAY, 1) * 0.95;
+  canvas.style.width = (DISPLAY * scale) + 'px';
+  canvas.style.height = (DISPLAY * scale) + 'px';
+}
+fitCanvas();
+window.addEventListener('resize', fitCanvas);
+
+// ==================== COLORMAP ====================
+// matplotlib 'terrain' colormap
+function terrainColor(t) {
+  const stops = [
+    [0.000, [51,  51,  153]],
+    [0.150, [0,   102, 255]],
+    [0.250, [0,   204, 102]],
+    [0.500, [153, 230, 76]],
+    [0.750, [255, 230, 102]],
+    [0.850, [227, 209, 66]],
+    [1.000, [252, 252, 252]],
+  ];
+  t = Math.max(0, Math.min(1, t));
+  for (let i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      const t0 = stops[i-1][0], t1 = stops[i][0];
+      const c0 = stops[i-1][1], c1 = stops[i][1];
+      const f = (t - t0) / (t1 - t0);
+      return [
+        Math.round(c0[0] + f * (c1[0] - c0[0])),
+        Math.round(c0[1] + f * (c1[1] - c0[1])),
+        Math.round(c0[2] + f * (c1[2] - c0[2])),
+      ];
+    }
+  }
+  return stops[stops.length-1][1];
+}
+
+// ==================== RENDER ====================
+const imageData = ctx.createImageData(DISPLAY, DISPLAY);
+const px = imageData.data;
+const scale = DISPLAY / W;
+
+function render() {
+  const sx = DISPLAY / W, sy = DISPLAY / H;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const t = heightmap[y * W + x];
+      let r, g, b;
+      if (viewMode === 'terrain') {
+        [r, g, b] = terrainColor(t);
+      } else if (viewMode === 'gray') {
+        const v = Math.round(t * 255);
+        r = g = b = v;
+      } else { // topo
+        // grayscale + contour lines
+        const v = Math.round(t * 255);
+        r = g = b = v;
+        const frac = (t * 20) % 1;
+        if (frac < 0.04) { r = 180; g = 100; b = 60; }
+      }
+      // fill scaled block
+      for (let dy = 0; dy < sy; dy++) {
+        for (let dx = 0; dx < sx; dx++) {
+          const py2 = y * sy + dy, px2 = x * sx + dx;
+          const idx = (py2 * DISPLAY + px2) * 4;
+          px[idx]   = r;
+          px[idx+1] = g;
+          px[idx+2] = b;
+          px[idx+3] = 255;
+        }
+      }
+    }
+  }
+  ctx.putImageData(imageData, 0, 0);
+}
+
+// ==================== BRUSH ====================
+function gaussianBrush(cx, cy, radius, hard) {
+  // returns array of {x, y, weight}
+  const r = Math.ceil(radius);
+  const result = [];
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
+      const dist = Math.sqrt(dx*dx + dy*dy);
+      if (dist > radius) continue;
+      const nx = cx + dx, ny = cy + dy;
+      if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+      // falloff: hard=1 → top hat, hard=0 → full gaussian
+      let w;
+      const normDist = dist / radius;
+      if (normDist < hard) {
+        w = 1.0;
+      } else {
+        const t2 = (normDist - hard) / (1 - hard + 0.001);
+        w = Math.exp(-3 * t2 * t2);
+      }
+      result.push({ x: nx, y: ny, w });
+    }
+  }
+  return result;
+}
+
+function applyBrush(cx, cy) {
+  const cells = gaussianBrush(cx, cy, brushSize / 2, brushHard);
+  const dt = 0.004 * brushStr * 100;
+
+  if (tool === 'smooth') {
+    // gaussian smooth around each affected cell
+    for (const { x, y, w } of cells) {
+      let sum = 0, cnt = 0;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
+            sum += heightmap[ny * W + nx];
+            cnt++;
+          }
+        }
+      }
+      const avg = sum / cnt;
+      heightmap[y * W + x] += (avg - heightmap[y * W + x]) * w * dt * 5;
+    }
+  } else if (tool === 'flatten') {
+    for (const { x, y, w } of cells) {
+      const cur = heightmap[y * W + x];
+      heightmap[y * W + x] += (flattenTarget - cur) * w * dt * 3;
+    }
+  } else if (tool === 'noise') {
+    for (const { x, y, w } of cells) {
+      heightmap[y * W + x] += (Math.random() - 0.5) * w * dt * 2;
+      heightmap[y * W + x] = Math.max(0, Math.min(1, heightmap[y * W + x]));
+    }
+  } else if (tool === 'raise') {
+    for (const { x, y, w } of cells) {
+      heightmap[y * W + x] = Math.min(1, heightmap[y * W + x] + w * dt);
+    }
+  } else if (tool === 'lower') {
+    for (const { x, y, w } of cells) {
+      heightmap[y * W + x] = Math.max(0, heightmap[y * W + x] - w * dt);
+    }
+  } else if (tool === 'sample') {
+    let sum = 0, cnt = 0;
+    for (const { x, y, w } of cells) {
+      sum += heightmap[y * W + x] * w;
+      cnt += w;
+    }
+    if (cnt > 0) sampledHeight = sum / cnt;
+    flattenTarget = sampledHeight;
+    document.getElementById('flatten-target').value = Math.round(flattenTarget * 100);
+    document.getElementById('flatten-val').textContent = Math.round(flattenTarget * 100);
+    return;
+  }
+  render();
+}
+
+// ==================== MOUSE ====================
+function canvasPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) / rect.width * DISPLAY;
+  const cy = (e.clientY - rect.top) / rect.height * DISPLAY;
+  return {
+    x: Math.floor(cx / (DISPLAY / W)),
+    y: Math.floor(cy / (DISPLAY / H)),
+  };
+}
+
+let lastX = -1, lastY = -1;
+let strokeStart = null;
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  painting = true;
+  strokeStart = heightmap.slice();
+  const p = canvasPos(e);
+  lastX = p.x; lastY = p.y;
+  applyBrush(p.x, p.y);
+});
+
+canvas.addEventListener('mousemove', e => {
+  const p = canvasPos(e);
+  document.getElementById('coords').textContent = `X:${p.x} Y:${p.y}`;
+  const h = p.x >= 0 && p.x < W && p.y >= 0 && p.y < H
+    ? heightmap[p.y * W + p.x] : 0;
+  document.getElementById('height-val').textContent = `h:${h.toFixed(3)}`;
+  document.getElementById('info-pos').textContent = `${p.x}, ${p.y}`;
+  document.getElementById('info-height').textContent = h.toFixed(3);
+
+  if (!painting) return;
+  if (p.x === lastX && p.y === lastY) return;
+
+  // interpolate for smooth strokes
+  const dx = p.x - lastX, dy = p.y - lastY;
+  const steps = Math.max(Math.abs(dx), Math.abs(dy));
+  for (let i = 0; i <= steps; i++) {
+    const ix = Math.round(lastX + dx * (i / steps));
+    const iy = Math.round(lastY + dy * (i / steps));
+    applyBrush(ix, iy);
+  }
+  lastX = p.x; lastY = p.y;
+});
+
+canvas.addEventListener('mouseup', () => {
+  if (painting && strokeStart) {
+    pushUndo(strokeStart);
+  }
+  painting = false;
+  strokeStart = null;
+});
+
+canvas.addEventListener('mouseleave', () => {
+  document.getElementById('coords').textContent = '';
+  document.getElementById('height-val').textContent = '';
+  if (painting && strokeStart) {
+    pushUndo(strokeStart);
+    painting = false;
+    strokeStart = null;
+  }
+});
+
+// ==================== UNDO ====================
+function pushUndo(snapshot) {
+  undoStack.push(snapshot);
+  if (undoStack.length > MAX_UNDO) undoStack.shift();
+  redoStack = [];
+  updateUndoInfo();
+}
+
+function undo() {
+  if (undoStack.length === 0) return;
+  redoStack.push(heightmap.slice());
+  heightmap = undoStack.pop();
+  render();
+  updateUndoInfo();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  undoStack.push(heightmap.slice());
+  heightmap = redoStack.pop();
+  render();
+  updateUndoInfo();
+}
+
+function updateUndoInfo() {
+  document.getElementById('info-undo').textContent = undoStack.length;
+}
+
+// ==================== NOISE GENERATION ====================
+// Simple value noise
+function lerp(a, b, t) { return a + (t - a) * t; }
+function fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+function permute(x) { return ((x * 34 + 1) * x) & 255; }
+
+function valueNoise(nx, ny, seed) {
+  const ix = Math.floor(nx) & 255, iy = Math.floor(ny) & 255;
+  const fx = nx - Math.floor(nx), fy = ny - Math.floor(ny);
+  const ux = fade(fx), uy = fade(fy);
+  const r00 = (permute(permute(ix + seed) + iy) / 255);
+  const r10 = (permute(permute(ix+1 + seed) + iy) / 255);
+  const r01 = (permute(permute(ix + seed) + iy+1) / 255);
+  const r11 = (permute(permute(ix+1 + seed) + iy+1) / 255);
+  const a = r00 + ux * (r10 - r00);
+  const b = r01 + ux * (r11 - r01);
+  return a + uy * (b - a);
+}
+
+function fractalNoise(x, y, octaves, seed) {
+  let v = 0, amp = 0.5, freq = 1, max = 0;
+  for (let i = 0; i < octaves; i++) {
+    v += valueNoise(x * freq, y * freq, seed + i * 37) * amp;
+    max += amp;
+    amp *= 0.5;
+    freq *= 2.0;
+  }
+  return v / max;
+}
+
+function genPerlin() {
+  pushUndo(heightmap.slice());
+  const seed = Math.floor(Math.random() * 200);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const nx = x / W * 4, ny = y / H * 4;
+      heightmap[y * W + x] = fractalNoise(nx, ny, 6, seed);
+    }
+  }
+  render();
+}
+
+function genIsland() {
+  pushUndo(heightmap.slice());
+  const seed = Math.floor(Math.random() * 200);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const nx = x / W * 4, ny = y / H * 4;
+      let v = fractalNoise(nx, ny, 6, seed);
+      // distance from center mask
+      const dx2 = (x / W - 0.5) * 2, dy2 = (y / H - 0.5) * 2;
+      const d = Math.sqrt(dx2*dx2 + dy2*dy2);
+      const mask = Math.max(0, 1 - d * 1.3);
+      v = v * mask * mask;
+      heightmap[y * W + x] = Math.max(0, Math.min(1, v));
+    }
+  }
+  render();
+}
+
+function genClear() {
+  pushUndo(heightmap.slice());
+  heightmap.fill(0.15);
+  render();
+}
+
+// ==================== EXPORT ====================
+function exportPreview() {
+  const expCanvas = document.createElement('canvas');
+  expCanvas.width = W; expCanvas.height = H;
+  const expCtx = expCanvas.getContext('2d');
+  const id = expCtx.createImageData(W, H);
+  const d = id.data;
+  for (let i = 0; i < W * H; i++) {
+    const [r, g, b] = terrainColor(heightmap[i]);
+    d[i*4]   = r;
+    d[i*4+1] = g;
+    d[i*4+2] = b;
+    d[i*4+3] = 255;
+  }
+  expCtx.putImageData(id, 0, 0);
+  const a = document.createElement('a');
+  a.download = 'terrain_preview.png';
+  a.href = expCanvas.toDataURL('image/png');
+  a.click();
+}
+
+function exportGray() {
+  const expCanvas = document.createElement('canvas');
+  expCanvas.width = W; expCanvas.height = H;
+  const expCtx = expCanvas.getContext('2d');
+  const id = expCtx.createImageData(W, H);
+  const d = id.data;
+  for (let i = 0; i < W * H; i++) {
+    const v = Math.round(heightmap[i] * 255);
+    d[i*4]   = v;
+    d[i*4+1] = v;
+    d[i*4+2] = v;
+    d[i*4+3] = 255;
+  }
+  expCtx.putImageData(id, 0, 0);
+  const a = document.createElement('a');
+  a.download = 'terrain_heightmap.png';
+  a.href = expCanvas.toDataURL('image/png');
+  a.click();
+}
+
+// ==================== UI WIRING ====================
+document.querySelectorAll('.tool-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    tool = btn.dataset.tool;
+    document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('flatten-target-row').style.display =
+      (tool === 'flatten' || tool === 'sample') ? '' : 'none';
+  });
+});
+
+document.querySelectorAll('.grad-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    viewMode = btn.dataset.view;
+    document.querySelectorAll('.grad-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    render();
+  });
+});
+
+document.getElementById('brush-size').addEventListener('input', function() {
+  brushSize = +this.value;
+  document.getElementById('brush-size-val').textContent = brushSize;
+});
+document.getElementById('brush-str').addEventListener('input', function() {
+  brushStr = +this.value / 100;
+  document.getElementById('brush-str-val').textContent = this.value;
+});
+document.getElementById('brush-hard').addEventListener('input', function() {
+  brushHard = +this.value / 100;
+  document.getElementById('brush-hard-val').textContent = this.value;
+});
+document.getElementById('flatten-target').addEventListener('input', function() {
+  flattenTarget = +this.value / 100;
+  document.getElementById('flatten-val').textContent = this.value;
+});
+
+document.getElementById('undo-btn').addEventListener('click', undo);
+document.getElementById('redo-btn').addEventListener('click', redo);
+document.getElementById('gen-perlin').addEventListener('click', genPerlin);
+document.getElementById('gen-island').addEventListener('click', genIsland);
+document.getElementById('gen-clear').addEventListener('click', genClear);
+document.getElementById('export-preview').addEventListener('click', exportPreview);
+document.getElementById('export-gray').addEventListener('click', exportGray);
+
+// ==================== KEYBOARD ====================
+const toolKeys = ['raise','lower','smooth','flatten','noise','sample'];
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey && e.key === 'z') { e.preventDefault(); undo(); return; }
+  if (e.ctrlKey && e.key === 'y') { e.preventDefault(); redo(); return; }
+  if (e.key === '[') {
+    brushSize = Math.max(2, brushSize - 5);
+    document.getElementById('brush-size').value = brushSize;
+    document.getElementById('brush-size-val').textContent = brushSize;
+  }
+  if (e.key === ']') {
+    brushSize = Math.min(100, brushSize + 5);
+    document.getElementById('brush-size').value = brushSize;
+    document.getElementById('brush-size-val').textContent = brushSize;
+  }
+  if (e.key >= '1' && e.key <= '6') {
+    const t = toolKeys[+e.key - 1];
+    if (t) {
+      tool = t;
+      document.querySelectorAll('.tool-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.tool === tool);
+      });
+      document.getElementById('flatten-target-row').style.display =
+        (tool === 'flatten' || tool === 'sample') ? '' : 'none';
+    }
+  }
+  if (e.key === ' ') {
+    e.preventDefault();
+    const modes = ['terrain','gray','topo'];
+    const idx = (modes.indexOf(viewMode) + 1) % modes.length;
+    viewMode = modes[idx];
+    document.querySelectorAll('.grad-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.view === viewMode);
+    });
+    render();
+  }
+});
+
+// ==================== INIT ====================
+genPerlin();
+</script>
+</body>
+</html>

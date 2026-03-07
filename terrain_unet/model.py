@@ -31,11 +31,12 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """ConvTranspose stride=2 → InstanceNorm → (Dropout) → ReLU"""
+    """Bilinear upsample × 2 → Conv3×3 → InstanceNorm → (Dropout) → ReLU"""
     def __init__(self, in_ch: int, out_ch: int, dropout: bool = False):
         super().__init__()
         layers = [
-            nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1, bias=False),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1, bias=False),
             nn.InstanceNorm2d(out_ch, affine=True),
         ]
         if dropout:
@@ -83,7 +84,8 @@ class UNetGenerator(nn.Module):
         self.d6 = UpBlock(nf*4*2,  nf*2)                # 64→128, in=nf*4*2 (d5+e2)
         self.d7 = UpBlock(nf*2*2,  nf)                  # 128→256, in=nf*2*2 (d6+e1)
         self.d8 = nn.Sequential(
-            nn.ConvTranspose2d(nf*2, out_ch, 4, 2, 1),  # 256→512, in=nf*2 (d7+e0)
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 256→512
+            nn.Conv2d(nf*2, out_ch, 3, 1, 1),  # in=nf*2 (d7+e0)
             nn.Tanh(),
         )
 

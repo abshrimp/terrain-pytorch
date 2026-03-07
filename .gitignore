@@ -8,7 +8,8 @@ zip_files/
 array_files/
 training_images/
 *.csv
-# *.pkl
+*.pkl
+*.pt
 
 # Generated terrain files.
 ml_outputs/
