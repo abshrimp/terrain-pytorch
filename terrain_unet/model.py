@@ -1,5 +1,5 @@
 """
-pix2pix モデル定義
+pix2pix モデル定義 (アーティファクト対策版)
   - UNetGenerator  : smooth terrain → detailed terrain
   - PatchDiscriminator : 70×70 PatchGAN
 """
@@ -17,10 +17,13 @@ def get_device():
 
 
 class DownBlock(nn.Module):
-    """Conv stride=2 → InstanceNorm → LeakyReLU"""
+    """MaxPool2d による縮小 → Conv3×3 (stride=1) → InstanceNorm → LeakyReLU"""
     def __init__(self, in_ch: int, out_ch: int, norm: bool = True):
         super().__init__()
-        layers = [nn.Conv2d(in_ch, out_ch, 4, 2, 1, bias=not norm)]
+        layers = [
+            nn.MaxPool2d(2),
+            nn.Conv2d(in_ch, out_ch, 3, 1, 1, bias=not norm)
+        ]
         if norm:
             layers.append(nn.InstanceNorm2d(out_ch, affine=True))
         layers.append(nn.LeakyReLU(0.2, inplace=True))
@@ -31,12 +34,13 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Bilinear upsample × 2 → Conv3×3 → InstanceNorm → (Dropout) → ReLU"""
+    """Bilinear upsample × 2 → Conv5×5 (replicate pad) → InstanceNorm → (Dropout) → ReLU"""
     def __init__(self, in_ch: int, out_ch: int, dropout: bool = False):
         super().__init__()
         layers = [
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-            nn.Conv2d(in_ch, out_ch, 3, 1, 1, bias=False),
+            # カーネルサイズを5に広げ、replicateパディングで端のノイズを抑える
+            nn.Conv2d(in_ch, out_ch, 5, 1, 2, bias=False, padding_mode='replicate'),
             nn.InstanceNorm2d(out_ch, affine=True),
         ]
         if dropout:
@@ -62,11 +66,12 @@ class UNetGenerator(nn.Module):
         nf = ngf
 
         # ---- Encoder ----
-        # 最初のレイヤーは InstanceNorm なし (pix2pix の標準)
+        # 最初のレイヤーも MaxPool2d に置き換え
         self.e0 = nn.Sequential(
-            nn.Conv2d(in_ch, nf, 4, 2, 1),
+            nn.Conv2d(in_ch, nf, 3, 1, 1, padding_mode='replicate'), # 512→512
+            nn.MaxPool2d(2),                                         # 512→256
             nn.LeakyReLU(0.2, inplace=True),
-        )                                          # 512→256, ch: 1→nf
+        )
         self.e1 = DownBlock(nf,   nf*2)           # 256→128, ch: nf→nf*2
         self.e2 = DownBlock(nf*2, nf*4)           # 128→64,  ch: nf*2→nf*4
         self.e3 = DownBlock(nf*4, nf*8)           # 64→32,   ch: nf*4→nf*8
@@ -85,7 +90,7 @@ class UNetGenerator(nn.Module):
         self.d7 = UpBlock(nf*2*2,  nf)                  # 128→256, in=nf*2*2 (d6+e1)
         self.d8 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),  # 256→512
-            nn.Conv2d(nf*2, out_ch, 3, 1, 1),  # in=nf*2 (d7+e0)
+            nn.Conv2d(nf*2, out_ch, 5, 1, 2, padding_mode='replicate'),         # in=nf*2 (d7+e0)
             nn.Tanh(),
         )
 
