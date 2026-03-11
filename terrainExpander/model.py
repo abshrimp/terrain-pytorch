@@ -44,10 +44,11 @@ class Down(nn.Module):
     def forward(self, x): return self.net(x)
 
 class Up(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
+        # x を 1/2ch にアップサンプル → skip と concat → conv
         self.up   = nn.ConvTranspose2d(in_ch, in_ch//2, 2, stride=2)
-        self.conv = DoubleConv(in_ch, out_ch)
+        self.conv = DoubleConv(in_ch//2 + skip_ch, out_ch)
     def forward(self, x, skip):
         x = self.up(x)
         x = torch.cat([skip, x], dim=1)
@@ -134,11 +135,21 @@ class TerrainExpander(nn.Module):
         self.fusion = ContextFusion(ch=ch*16, heads=8)
 
         # デコーダ（UNet スタイル）
-        self.up1 = Up(ch*16 + ch*16, ch*8)    # 32→64
-        self.up2 = Up(ch*8  + ch*8,  ch*4)    # 64→128
-        self.up3 = Up(ch*4  + ch*4,  ch*2)    # 128→256
-        self.up4 = Up(ch*2  + ch*2,  ch)      # 256→512
-        self.out = nn.Conv2d(ch, 1, 1)   # 16bit グレースケール出力
+        # Up(in_ch, skip_ch, out_ch)
+        # in_ch  : このUpブロックへの入力チャンネル数
+        # skip_ch: エンコーダからのskip connectionのチャンネル数
+        # out_ch : 出力チャンネル数
+        #
+        # fused: [B, 512, 16, 16]
+        # s4_l:  [B, 512, 32, 32]   s3_l: [B, 256, 64, 64]
+        # s2_l:  [B, 128,128,128]   s1_l: [B,  64,256,256]
+        # s0_l:  [B,  32,512,512]
+        self.up1 = Up(ch*16, ch*16, ch*8)  # 512→256, +s4(512)→768→256  [32px]
+        self.up2 = Up(ch*8,  ch*8,  ch*4)  # 256→128, +s3(256)→384→128  [64px]
+        self.up3 = Up(ch*4,  ch*4,  ch*2)  # 128→ 64, +s2(128)→192→ 64  [128px]
+        self.up4 = Up(ch*2,  ch*2,  ch)    #  64→ 32, +s1( 64)→ 96→ 32  [256px]
+        self.up5 = Up(ch,    ch,    ch)    #  32→ 16, +s0( 32)→ 48→ 32  [512px]
+        self.out = nn.Conv2d(ch, 1, 1)     # 16bit グレースケール出力
         self.act = nn.Sigmoid()
 
     def forward(self, topleft, top, left):
@@ -160,6 +171,7 @@ class TerrainExpander(nn.Module):
         x = self.up2(x,      s3_l)
         x = self.up3(x,      s2_l)
         x = self.up4(x,      s1_l)
+        x = self.up5(x,      s0_l)
         return self.act(self.out(x))   # [B, 1, 512, 512]
 
 
