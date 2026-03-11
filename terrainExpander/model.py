@@ -63,7 +63,7 @@ class PatchEncoder(nn.Module):
     """
     def __init__(self, base_ch=32):
         super().__init__()
-        self.inc  = DoubleConv(1, base_ch)        # 512
+        self.inc  = DoubleConv(3, base_ch)        # 512  (RGB 24bit入力)
         self.d1   = Down(base_ch,   base_ch*2)    # 256
         self.d2   = Down(base_ch*2, base_ch*4)    # 128
         self.d3   = Down(base_ch*4, base_ch*8)    # 64
@@ -84,32 +84,36 @@ class PatchEncoder(nn.Module):
 
 class ContextFusion(nn.Module):
     """
-    3つのエンコーダ出力のbottleneckをCross-Attentionで統合
+    3枚のbottleneckを concat + conv で統合。
+    MultiheadAttention の代わりにシンプルな畳み込みを使う。
+
+    入力: 3枚の [B, C, H, W]  → concat で [B, 3C, H, W]
+    出力: [B, C, H, W]
     """
-    def __init__(self, ch=512, heads=8):
+    def __init__(self, ch=512, heads=8):  # heads は互換性のため残す（未使用）
         super().__init__()
-        self.attn = nn.MultiheadAttention(ch, heads, batch_first=True)
-        self.norm = nn.LayerNorm(ch)
-        self.ff   = nn.Sequential(
-            nn.Linear(ch, ch*2), nn.ReLU(), nn.Linear(ch*2, ch))
-        self.norm2 = nn.LayerNorm(ch)
+        # 3C → C に圧縮する 1×1 conv + 3×3 conv
+        self.fuse = nn.Sequential(
+            nn.Conv2d(ch * 3, ch, 1, bias=False),   # チャネル圧縮
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(ch, ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+        )
+        # 左パッチ（最も近い文脈）との残差接続用
+        self.residual = nn.Conv2d(ch, ch, 1, bias=False)
 
     def forward(self, bot_list):
         """
         bot_list: [topleft_bot, top_bot, left_bot]  各 [B, C, H, W]
         """
-        B, C, H, W = bot_list[0].shape
-        # flatten spatial: [B, H*W, C]
-        tokens = [b.flatten(2).permute(0,2,1) for b in bot_list]
-        # 3枚を連結してコンテキストとする
-        context = torch.cat(tokens, dim=1)   # [B, 3*H*W, C]
-        query   = tokens[-1]                 # 左パッチを起点クエリに
-
-        out, _ = self.attn(query, context, context)
-        out = self.norm(query + out)
-        out = self.norm2(out + self.ff(out))
-        # [B, H*W, C] → [B, C, H, W]
-        return out.permute(0,2,1).reshape(B, C, H, W)
+        # 3枚を channel 方向に concat → [B, 3C, H, W]
+        x = torch.cat(bot_list, dim=1)
+        out = self.fuse(x)
+        # 左パッチ（bot_list[-1]）との残差接続
+        out = out + self.residual(bot_list[-1])
+        return out
 
 
 # ---------------------------------------------------- terrain expander --
@@ -134,7 +138,7 @@ class TerrainExpander(nn.Module):
         self.up2 = Up(ch*8  + ch*8,  ch*4)    # 64→128
         self.up3 = Up(ch*4  + ch*4,  ch*2)    # 128→256
         self.up4 = Up(ch*2  + ch*2,  ch)      # 256→512
-        self.out = nn.Conv2d(ch, 1, 1)
+        self.out = nn.Conv2d(ch, 3, 1)   # RGB 24bit出力
         self.act = nn.Sigmoid()
 
     def forward(self, topleft, top, left):
@@ -174,8 +178,9 @@ class PatchDiscriminator(nn.Module):
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
+        # 入力: コンテキスト3枚(RGB) + ターゲット(RGB) = 12ch
         self.net = nn.Sequential(
-            *block(4, base_ch,    norm=False),  # 4ch入力
+            *block(12, base_ch,    norm=False),
             *block(base_ch,   base_ch*2),
             *block(base_ch*2, base_ch*4),
             *block(base_ch*4, base_ch*8, stride=1),
