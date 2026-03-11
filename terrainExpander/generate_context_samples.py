@@ -18,7 +18,7 @@ import skimage.measure
 from PIL import Image
 from tqdm import tqdm
 
-RAW_TILES_DIR = "./raw_tiles"
+RAW_TILES_DIR = "../raw_tiles"
 OUTPUT_DIR    = "./context_samples"
 TILE_SIZE     = 256
 PATCH_PX      = TILE_SIZE * 2
