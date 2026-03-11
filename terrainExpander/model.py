@@ -63,7 +63,7 @@ class PatchEncoder(nn.Module):
     """
     def __init__(self, base_ch=32):
         super().__init__()
-        self.inc  = DoubleConv(3, base_ch)        # 512  (RGB 24bit入力)
+        self.inc  = DoubleConv(1, base_ch)        # 512  (16bit グレースケール入力)
         self.d1   = Down(base_ch,   base_ch*2)    # 256
         self.d2   = Down(base_ch*2, base_ch*4)    # 128
         self.d3   = Down(base_ch*4, base_ch*8)    # 64
@@ -138,7 +138,7 @@ class TerrainExpander(nn.Module):
         self.up2 = Up(ch*8  + ch*8,  ch*4)    # 64→128
         self.up3 = Up(ch*4  + ch*4,  ch*2)    # 128→256
         self.up4 = Up(ch*2  + ch*2,  ch)      # 256→512
-        self.out = nn.Conv2d(ch, 3, 1)   # RGB 24bit出力
+        self.out = nn.Conv2d(ch, 1, 1)   # 16bit グレースケール出力
         self.act = nn.Sigmoid()
 
     def forward(self, topleft, top, left):
@@ -178,9 +178,9 @@ class PatchDiscriminator(nn.Module):
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
-        # 入力: コンテキスト3枚(RGB) + ターゲット(RGB) = 12ch
+        # 入力: コンテキスト3枚(1ch) + ターゲット(1ch) = 4ch
         self.net = nn.Sequential(
-            *block(12, base_ch,    norm=False),
+            *block(4, base_ch,    norm=False),
             *block(base_ch,   base_ch*2),
             *block(base_ch*2, base_ch*4),
             *block(base_ch*4, base_ch*8, stride=1),
