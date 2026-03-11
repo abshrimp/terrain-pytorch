@@ -5,10 +5,10 @@
 
 出力:
   context_samples/
-    {id}_ctx_topleft.png   左上パッチ (512×512)
-    {id}_ctx_top.png       上パッチ   (512×512)
-    {id}_ctx_left.png      左パッチ   (512×512)
-    {id}_target.png        予測対象   (512×512)
+    {id}_ctx_topleft.png   左上パッチ (512×512, 16bit グレースケール)
+    {id}_ctx_top.png       上パッチ   (512×512, 16bit グレースケール)
+    {id}_ctx_left.png      左パッチ   (512×512, 16bit グレースケール)
+    {id}_target.png        予測対象   (512×512, 16bit グレースケール)
     meta.csv
 """
 
@@ -18,14 +18,12 @@ import skimage.measure
 from PIL import Image
 from tqdm import tqdm
 
-RAW_TILES_DIR = "../raw_tiles"
+RAW_TILES_DIR = "./raw_tiles"
 OUTPUT_DIR    = "./context_samples"
 TILE_SIZE     = 256
 PATCH_PX      = TILE_SIZE * 2
 MAX_ELEV      = 1600.0
-MISSING_ELV   = -9999.0
 
-# フィルタ閾値（既存スクリプトと同じ）
 MIN_ELEV_RANGE    = 40.0
 MAX_NEAR_MIN_FRAC = 0.20
 MIN_ENTROPY       = 10.0
@@ -37,23 +35,6 @@ BLACKLIST = {
         {"name": "浅間山",         "x_range": (3622, 3625), "y_range": (1601, 1604)},
         {"name": "箱根カルデラ",   "x_range": (3627, 3631), "y_range": (1617, 1620)},
         {"name": "阿蘇山カルデラ", "x_range": (3537, 3541), "y_range": (1649, 1653)},
-        {"name": "追加エリア",     "x_range": (3620, 3623), "y_range": (1606, 1609)},
-        {"name": "追加エリア",     "x_range": (3627, 3629), "y_range": (1600, 1602)},
-        {"name": "追加エリア",     "x_range": (3630, 3632), "y_range": (1599, 1601)},
-        {"name": "追加エリア",     "x_range": (3650, 3651), "y_range": (1543, 1544)},
-        {"name": "追加エリア",     "x_range": (3648, 3648), "y_range": (1554, 1555)},
-        {"name": "追加エリア",     "x_range": (3651, 3652), "y_range": (1552, 1553)},
-        {"name": "追加エリア",     "x_range": (3640, 3642), "y_range": (1584, 1586)},
-        {"name": "追加エリア",     "x_range": (3643, 3645), "y_range": (1539, 1541)},
-        {"name": "追加エリア",     "x_range": (3640, 3641), "y_range": (1563, 1564)},
-        {"name": "追加エリア",     "x_range": (3535, 3538), "y_range": (1663, 1667)},
-        {"name": "追加エリア",     "x_range": (3649, 3650), "y_range": (1507, 1508)},
-        {"name": "追加エリア",     "x_range": (3649, 3651), "y_range": (1510, 1511)},
-        {"name": "追加エリア",     "x_range": (3648, 3649), "y_range": (1518, 1519)},
-        {"name": "追加エリア",     "x_range": (3655, 3656), "y_range": (1508, 1509)},
-        {"name": "追加エリア",     "x_range": (3689, 3692), "y_range": (1494, 1496)},
-        {"name": "追加エリア",     "x_range": (3686, 3688), "y_range": (1497, 1499)},
-        {"name": "追加エリア",     "x_range": (3654, 3656), "y_range": (1469, 1471)},
         {"name": "追加エリア",     "x_range": (3631, 3646), "y_range": (1624, 1671)},
     ],
 }
@@ -89,51 +70,65 @@ def load_patch(tile_map, x0, y0):
     return p
 
 def normalize(patch):
+    """絶対標高 [0, MAX_ELEV] -> [0.0, 1.0]。パッチ間の標高差を保持するため相対正規化しない。"""
     if float(patch.max()-patch.min()) < MIN_ELEV_RANGE: return None
     if float((patch < patch.min()+8.0).sum())/patch.size > MAX_NEAR_MIN_FRAC: return None
     if skimage.measure.shannon_entropy(patch) < MIN_ENTROPY: return None
-    p_max = float(patch.max())
-    if p_max > MAX_ELEV:
-        patch = patch - (p_max - MAX_ELEV)
-        p_min = float(patch.min())
-        if p_min < 0.0:
-            patch = (patch-p_min)/(MAX_ELEV-p_min)*MAX_ELEV
-    return patch / MAX_ELEV
+    patch = np.clip(patch, 0.0, MAX_ELEV)
+    return (patch / MAX_ELEV).astype(np.float32)
 
 def save16(arr, path):
-    Image.fromarray(np.round(arr*65535).astype(np.uint16)).save(path)
+    """float32 [0,1] を 16bit グレースケール PNG として保存"""
+    Image.fromarray(np.round(arr * 65535).astype(np.uint16)).save(path)
 
-def get_variants(tl, t, l, target):
-    """4回転 × 反転 = 8通り（4枚を同時に変換）"""
-    for flip in [False, True]:
-        if flip:
-            tl2,t2,l2,tgt2 = np.fliplr(tl),np.fliplr(t),np.fliplr(l),np.fliplr(target)
-        else:
-            tl2,t2,l2,tgt2 = tl,t,l,target
-        for k in range(4):
-            yield (np.rot90(tl2,k), np.rot90(t2,k),
-                   np.rot90(l2,k),  np.rot90(tgt2,k))
+def get_variants(tl, t, l, x):
+    """
+    2x2グリッド全体を回転・反転する。
+    配置の入れ替え + 各パッチ画像の変換を同時に行うことで
+    パッチ間の境界連続性を保持する。
+
+    元配置:        90°CCW後:
+      [tl][t]  ->  [t][x]
+      [l ][x]      [tl][l]
+    """
+    def rot90ccw(tl, t, l, x):
+        return (np.rot90(t,1), np.rot90(x,1), np.rot90(tl,1), np.rot90(l,1))
+
+    def fliplr_grid(tl, t, l, x):
+        return (np.fliplr(t), np.fliplr(tl), np.fliplr(x), np.fliplr(l))
+
+    configs = []
+    cur = (tl, t, l, x)
+    for _ in range(4):
+        configs.append(cur)
+        cur = rot90ccw(*cur)
+    for c in list(configs):
+        configs.append(fliplr_grid(*c))
+    for vtl, vt, vl, vx in configs:
+        yield vtl, vt, vl, vx
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     by_zoom = load_tile_index(RAW_TILES_DIR)
+    if not by_zoom:
+        print(f"エラー: {RAW_TILES_DIR} にタイルが見つかりません")
+        return
+
     meta_rows = []
     sid = 0
 
     for z in sorted(by_zoom):
         tile_map = by_zoom[z]
-        bl = build_blacklist_tileset(BLACKLIST.get(z,[]))
+        bl = build_blacklist_tileset(BLACKLIST.get(z, []))
         xs = sorted({x for x,_ in tile_map})
         ys = sorted({y for _,y in tile_map})
         print(f"zoom={z}: {len(tile_map)} tiles")
 
-        stats = dict(ok=0, miss=0, filt=0)
+        stats = dict(ok=0, miss=0, filt=0, bl=0)
 
-        # ステップ=2 (2×2パッチなので隣は+2)
         with tqdm(total=len(xs)*len(ys)) as pbar:
             for x0 in xs:
                 for y0 in ys:
-                    # 4パッチの座標（左上・上・左・ターゲット）
                     coords = {
                         "topleft": (x0-2, y0-2),
                         "top":     (x0,   y0-2),
@@ -141,16 +136,14 @@ def main():
                         "target":  (x0,   y0  ),
                     }
 
-                    # ブラックリスト
                     skip = False
-                    for name,(cx,cy) in coords.items():
-                        for tx in range(cx,cx+2):
-                            for ty in range(cy,cy+2):
+                    for _,(cx,cy) in coords.items():
+                        for tx in range(cx, cx+2):
+                            for ty in range(cy, cy+2):
                                 if (tx,ty) in bl: skip=True
                     if skip:
-                        pbar.update(1); continue
+                        stats["bl"] += 1; pbar.update(1); continue
 
-                    # 読み込み
                     patches = {}
                     for name,(cx,cy) in coords.items():
                         p = load_patch(tile_map, cx, cy)
@@ -159,7 +152,6 @@ def main():
                     if len(patches) < 4:
                         stats["miss"] += 1; pbar.update(1); continue
 
-                    # 正規化
                     normed = {}
                     bad = False
                     for name,p in patches.items():
@@ -169,7 +161,6 @@ def main():
                     if bad:
                         stats["filt"] += 1; pbar.update(1); continue
 
-                    # ×8 拡張して保存
                     for vtl,vt,vl,vtgt in get_variants(
                             normed["topleft"], normed["top"],
                             normed["left"],    normed["target"]):
@@ -177,22 +168,20 @@ def main():
                         save16(vt,   f"{OUTPUT_DIR}/{sid}_ctx_top.png")
                         save16(vl,   f"{OUTPUT_DIR}/{sid}_ctx_left.png")
                         save16(vtgt, f"{OUTPUT_DIR}/{sid}_target.png")
-                        meta_rows.append(dict(id=sid, z=z,
-                            x0=x0, y0=y0))
+                        meta_rows.append(dict(id=sid, z=z, x0=x0, y0=y0))
                         sid += 1
 
                     stats["ok"] += 1
                     pbar.update(1)
                     pbar.set_postfix(ok=stats["ok"], samples=sid)
 
-        print(f"  ok={stats['ok']} ({stats['ok']*8}samples) "
-              f"miss={stats['miss']} filt={stats['filt']}")
+        print(f"  採用: {stats['ok']} ({stats['ok']*8} samples)")
+        print(f"  除外: 欠損={stats['miss']} フィルタ={stats['filt']} BL={stats['bl']}")
 
-    import csv
-    with open(f"{OUTPUT_DIR}/meta.csv","w",newline="") as f:
+    with open(f"{OUTPUT_DIR}/meta.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["id","z","x0","y0"])
         w.writeheader(); w.writerows(meta_rows)
-    print(f"完了: {sid} サンプル")
+    print(f"\n完了: {sid} サンプル -> {OUTPUT_DIR}/")
 
 if __name__ == "__main__":
     main()
