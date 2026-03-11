@@ -89,13 +89,11 @@ def train():
     os.makedirs(CKPT_DIR, exist_ok=True)
 
     ds     = ContextDataset(SAMPLES_DIR)
-    # num_workers: shm枯渇時は減らす（0=メインプロセスのみ、最も安全）
-    # 512×512×4枚×float32 = 4MB/sample なのでworker数に注意
-    n_workers = min(4, os.cpu_count() or 1)
+    # num_workers=0: メインプロセスで読み込み（shm不要、最も安全）
+    # GPU環境で速度を上げたい場合は num_workers=2 程度から試す
     loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True,
-                        num_workers=n_workers,
-                        pin_memory=(DEVICE.type == "cuda"),
-                        persistent_workers=(n_workers > 0))
+                        num_workers=0,
+                        pin_memory=False)
     print(f"Dataset: {len(ds)} samples  Device: {DEVICE}")
 
     G = M.TerrainExpander(BASE_CH_G).to(DEVICE)
