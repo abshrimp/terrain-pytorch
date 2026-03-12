@@ -1,12 +1,15 @@
-# dataset.py
 import os
 import re
 import random
 import numpy as np
 import torch
+import skimage.measure  # ← 追加
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from config import BLACKLIST, IMAGE_SIZE, ELEVATION_MIN, ELEVATION_MAX
+from config import (
+    BLACKLIST, IMAGE_SIZE, ELEVATION_MIN, ELEVATION_MAX,
+    MIN_ELEV_RANGE, MAX_NEAR_MIN_FRAC, MIN_ENTROPY  # ← 追加
+)
 
 def is_blacklisted(z, x, y):
     if z not in BLACKLIST: return False
@@ -22,12 +25,35 @@ def process_and_convert_tile(npy_file_path):
     if not match: return None
     z, x, y = map(int, match.groups())
     
+    # 1. 座標ベースのブラックリスト除外
     if is_blacklisted(z, x, y): return None
         
     data = np.load(npy_file_path)
+    # -9999.0 などを0.0に揃え、最大標高をクリップする
     data = np.clip(data, ELEVATION_MIN, ELEVATION_MAX)
+
+    # ==========================================
+    # 2. 動的フィルタリング（内容ベースの除外）
+    # ==========================================
+    # 高低差が小さすぎる（平坦地）
+    elev_range = float(data.max() - data.min())
+    if elev_range < MIN_ELEV_RANGE:
+        return None
+
+    # 最小値付近のピクセルが多い（水域・平野）
+    near_min_frac = float((data < data.min() + 8.0).sum()) / data.size
+    if near_min_frac > MAX_NEAR_MIN_FRAC:
+        return None
+
+    # Shannon エントロピーが低い（データ破損・均質データ）
+    if skimage.measure.shannon_entropy(data) < MIN_ENTROPY:
+        return None
+    # ==========================================
+
+    # 3. 学習用の16bit正規化
     normalized = data / ELEVATION_MAX
     data_16bit = (normalized * 65535.0).astype(np.uint16)
+    
     return data_16bit
 
 class TerrainOutpaintingDataset(Dataset):
