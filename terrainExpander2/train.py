@@ -16,10 +16,10 @@ def main():
     print(f"使用デバイス: {device}")
 
     # データ読み込み
-    data_dir = "./data"
+    data_dir = "../raw_tiles"  # .npy ファイルがここにある前提
     npy_files = glob.glob(os.path.join(data_dir, "*.npy"))
     if not npy_files:
-        print("エラー: './data' に .npy ファイルがありません。")
+        print("エラー: '../raw_tiles' に .npy ファイルがありません。")
         return
 
     dataset = TerrainOutpaintingDataset(npy_files)
